@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.shipyard.dock.common.ApiResponse;
@@ -19,6 +20,7 @@ import com.shipyard.dock.domain.Vessel;
 import com.shipyard.dock.dto.ContractRequest;
 import com.shipyard.dock.dto.OwnerRequest;
 import com.shipyard.dock.dto.VesselRequest;
+import com.shipyard.dock.service.ContractPaymentService;
 import com.shipyard.dock.service.ContractService;
 import com.shipyard.dock.service.OwnerService;
 import com.shipyard.dock.service.VesselService;
@@ -26,7 +28,8 @@ import com.shipyard.dock.service.VesselService;
 /**
  * 模块二：船舶与修造合同（船东名录也挂在这里）。
  *
- * <p>页面形态为「时间轴 + 合同信息卡」：一条船一条时间轴，右侧挂合同信息卡。</p>
+ * <p>页面形态为「时间轴 + 合同信息卡」：一条船一条时间轴，右侧挂合同信息卡。
+ * 合同进入履行中后生成分期付款节点，节点结算状态在合同详情、合同列表与报验详情三处同源。</p>
  */
 @RestController
 @RequestMapping("/api/vessel")
@@ -35,11 +38,14 @@ public class VesselController {
     private final VesselService vesselService;
     private final ContractService contractService;
     private final OwnerService ownerService;
+    private final ContractPaymentService paymentService;
 
-    public VesselController(VesselService vesselService, ContractService contractService, OwnerService ownerService) {
+    public VesselController(VesselService vesselService, ContractService contractService,
+            OwnerService ownerService, ContractPaymentService paymentService) {
         this.vesselService = vesselService;
         this.contractService = contractService;
         this.ownerService = ownerService;
+        this.paymentService = paymentService;
     }
 
     // ---------------- 船舶 ----------------
@@ -111,6 +117,19 @@ public class VesselController {
     @PostMapping("/contracts/{id}/advance")
     public ApiResponse<Contract> contractAdvance(@PathVariable Long id) {
         return ApiResponse.success("合同状态已推进", contractService.advance(id));
+    }
+
+    /** 合同付款详情：付款节点（带实时阻塞项）+ 汇总 + 全部生成 / 重算 / 确认记录 */
+    @GetMapping("/contracts/{id}/payment")
+    public ApiResponse<Map<String, Object>> contractPayment(@PathVariable Long id) {
+        return ApiResponse.success(paymentService.detail(id));
+    }
+
+    /** 确认结算一个付款节点：行级锁 + 实时复算，多人同时确认 / 网络重试只有一个有效结果 */
+    @PostMapping("/contracts/payments/{nodeId}/confirm")
+    public ApiResponse<Map<String, Object>> confirmPayment(@PathVariable Long nodeId,
+            @RequestParam String operator) {
+        return ApiResponse.success("付款节点已确认结算", paymentService.confirmNode(nodeId, operator));
     }
 
     @DeleteMapping("/contracts/{id}")

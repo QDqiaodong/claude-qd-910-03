@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '../api'
 
 const props = defineProps({
@@ -12,8 +12,11 @@ const emit = defineEmits(['openTab'])
 const board = ref({ vessels: [], owners: [], contracts: [], typeMeta: [], types: [] })
 const detail = ref(null)
 const clearances = ref([])
+const payment = ref(null)
 const loading = ref(false)
+const acting = ref(false)
 const dialog = ref(false)
+const operator = ref(localStorage.getItem('payment-operator') || '')
 
 const form = ref({
   vesselNo: '', regNo: '', vesselName: '', vesselType: 'BULK', ownerId: null,
@@ -24,6 +27,7 @@ const form = ref({
 const vessels = computed(() => board.value.vessels || [])
 const contracts = computed(() => board.value.contracts || [])
 const vesselId = computed(() => Number(props.params?.vesselId || 0))
+const contractId = computed(() => Number(props.params?.contractId || 0))
 
 function statusColor(status) {
   if (status === 'DELIVERED') return 'var(--pass)'
@@ -36,6 +40,12 @@ function contractColor(status) {
   if (status === 'PERFORMING') return 'var(--slipway)'
   if (status === 'SIGNED') return 'var(--drydock)'
   return 'var(--steel)'
+}
+
+function nodeColor(status) {
+  if (status === 'SETTLED') return 'var(--pass)'
+  if (status === 'DUE') return 'var(--slipway)'
+  return 'var(--warn)'
 }
 
 function contractsOf(vesselId) {
@@ -71,12 +81,42 @@ function fmtTime(value) {
   return String(value || '').replace('T', ' ').slice(0, 19) || '-'
 }
 
+/** 付款记录里的报验结论快照 → 一行可读统计 */
+function fmtSurvey(summary) {
+  if (!summary) return '-'
+  return `合格 ${summary.pass} · 让步 ${summary.concession} · 不合格 ${summary.fail}（共 ${summary.total} 单）`
+}
+
+function fmtBlockers(blockers) {
+  if (!blockers || !blockers.length) return '-'
+  return blockers.map((b) => b.message).join('；')
+}
+
+function ensureOperator() {
+  operator.value = operator.value.trim()
+  if (!operator.value) {
+    ElMessage.warning('请先在右上角填写操作人')
+    return false
+  }
+  localStorage.setItem('payment-operator', operator.value)
+  return true
+}
+
 function openVessel(vessel) {
   emit('openTab', {
     path: '/vessel',
     title: vessel.vesselNo + ' ' + vessel.vesselName,
     sub: vessel.ownerName,
     params: { vesselId: vessel.id }
+  })
+}
+
+function openContract(contract) {
+  emit('openTab', {
+    path: '/vessel',
+    title: '合同 ' + contract.contractNo,
+    sub: contract.vesselName,
+    params: { contractId: contract.id }
   })
 }
 
@@ -111,6 +151,34 @@ async function advanceContract(contract) {
   }
 }
 
+/** 确认结算一个付款节点：进行中拦截重复点击，后端行级锁兜底 */
+async function confirmNode(node) {
+  if (!ensureOperator()) return
+  try {
+    await ElMessageBox.confirm(
+      `确认结算「${node.nodeName}」${node.amount} 万元？确认后节点置为已结算、金额记入合同已结算金额，操作者与时间留痕，且不可撤销。`,
+      `确认结算 ${payment.value.contract.contractNo}`,
+      { confirmButtonText: '确认结算', cancelButtonText: '再想想', type: 'warning' }
+    )
+  } catch {
+    return
+  }
+  if (acting.value) return
+  acting.value = true
+  try {
+    const data = await api.vessel.confirmPayment(node.id, operator.value)
+    payment.value = data
+    ElMessage.success(`「${node.nodeName}」已结算 ${node.amount} 万元`)
+    await loadBoard()
+  } catch (e) {
+    ElMessage.error(e.message)
+    // 并发确认 / 网络重试失败时刷新回真实状态，页面不留假成功
+    await loadPayment().catch(() => {})
+  } finally {
+    acting.value = false
+  }
+}
+
 async function createVessel() {
   loading.value = true
   try {
@@ -137,8 +205,12 @@ async function loadClearances() {
   clearances.value = vesselId.value ? await api.launch.ofVessel(vesselId.value) : []
 }
 
+async function loadPayment() {
+  payment.value = contractId.value ? await api.vessel.contractPayment(contractId.value) : null
+}
+
 async function reload() {
-  await Promise.all([loadBoard(), loadDetail(), loadClearances()])
+  await Promise.all([loadBoard(), loadDetail(), loadClearances(), loadPayment()])
 }
 
 async function load() {
@@ -162,20 +234,133 @@ watch(vesselId, () => {
   }
 })
 
+watch(contractId, () => {
+  if (contractId.value) {
+    loadPayment().catch((e) => ElMessage.error(e.message))
+  } else {
+    payment.value = null
+  }
+})
+
 onMounted(load)
 </script>
 
 <template>
   <div>
     <div class="view-head">
-      <span class="view-title" v-if="!vesselId">船舶与修造合同 · 时间轴</span>
+      <span class="view-title" v-if="contractId && payment">合同 {{ payment.contract.contractNo }} · 付款节点</span>
+      <span class="view-title" v-else-if="!vesselId">船舶与修造合同 · 时间轴</span>
       <span class="view-title" v-else>{{ detail?.vessel?.vesselNo }} {{ detail?.vessel?.vesselName }}</span>
-      <span class="view-tip">一条船一条时间轴，右侧挂合同信息卡；结算前必须引用至少一次报验通过记录</span>
-      <el-button size="small" type="primary" style="margin-left:auto" @click="dialog = true">新增船舶</el-button>
+      <span class="view-tip" v-if="contractId">结算按合同金额、报验结论与船舶状态计算；确认留痕，重算不改历史</span>
+      <span class="view-tip" v-else>一条船一条时间轴，右侧挂合同信息卡；进入履行中后生成分期付款节点，全部节点结算后合同才能整体结算</span>
+      <div class="op-box">
+        <el-input v-model="operator" size="small" placeholder="操作人（结算必填）" style="width: 140px" />
+        <el-button size="small" @click="load">刷新</el-button>
+        <el-button size="small" type="primary" @click="dialog = true">新增船舶</el-button>
+      </div>
     </div>
 
-    <!-- 单船分页 -->
-    <div v-if="vesselId && detail">
+    <!-- ============ 合同付款节点分页 ============ -->
+    <div v-if="contractId && payment">
+      <section class="panel">
+        <div class="panel-title">
+          {{ payment.contract.contractNo }}
+          <span class="tag-line" :style="{ background: contractColor(payment.contract.status), color: '#fff' }">{{ payment.contract.statusName }}</span>
+          <span class="view-tip">{{ payment.contract.vesselNo }} {{ payment.contract.vesselName }} · {{ payment.contract.contractTypeName }} · {{ payment.contract.ownerName }}</span>
+        </div>
+        <div class="vs-grid">
+          <div><span class="k">合同金额</span><b>{{ payment.contract.amount }} 万元</b></div>
+          <div><span class="k">已结算金额</span><b>{{ payment.summary.paidAmount }} 万元</b></div>
+          <div><span class="k">节点进度</span><b>{{ payment.summary.settledNodes }}/{{ payment.summary.totalNodes }} 已结算</b></div>
+          <div><span class="k">可结算 / 待结算</span><b>{{ payment.summary.dueNodes }} / {{ payment.summary.pendingNodes }}</b></div>
+          <div><span class="k">签订 / 交船</span><b>{{ payment.contract.signDate || '-' }} / {{ payment.contract.deliveryDate || '-' }}</b></div>
+          <div v-if="payment.contract.settleRef"><span class="k">结算依据</span><b>{{ payment.contract.settleRef }}</b></div>
+        </div>
+        <div class="pay-blockers" v-if="payment.summary.blockers.length">
+          <div class="pb-title">当前阻塞项（{{ payment.summary.blockers.length }}）</div>
+          <div v-for="(b, i) in payment.summary.blockers" :key="i" class="pb-item">· 【{{ b.nodeName }}】{{ b.message }}</div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          付款节点
+          <span class="view-tip">应付金额 = 合同金额 × 比例；条件未满足停留在待结算并逐条列明阻塞；已结算为终态，联动重算不覆盖</span>
+        </div>
+        <el-table :data="payment.nodes" size="small">
+          <el-table-column label="节点" width="110">
+            <template #default="{ row }"><b>{{ row.nodeName }}</b></template>
+          </el-table-column>
+          <el-table-column label="比例" width="70">
+            <template #default="{ row }">{{ Math.round(row.ratio * 100) }}%</template>
+          </el-table-column>
+          <el-table-column label="应付金额(万元)" width="110">
+            <template #default="{ row }">{{ row.amount }}</template>
+          </el-table-column>
+          <el-table-column label="状态" width="90">
+            <template #default="{ row }">
+              <span class="tag-line" :style="{ background: nodeColor(row.status), color: '#fff' }">{{ row.statusName }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="阻塞项 / 结算留痕">
+            <template #default="{ row }">
+              <div v-if="row.status === 'SETTLED'" class="nd-settled">
+                {{ row.settledBy }} · {{ fmtTime(row.settledAt) }} · 实结 {{ row.settledAmount }} 万元
+              </div>
+              <div v-else-if="row.blockers.length">
+                <div v-for="(b, i) in row.blockers" :key="i" class="nd-blocker">· {{ b.message }}</div>
+              </div>
+              <span v-else class="nd-ok">条件已满足，待确认</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="110">
+            <template #default="{ row }">
+              <el-button v-if="row.status === 'DUE'" size="small" type="primary" :disabled="acting" @click="confirmNode(row)">确认结算</el-button>
+              <span v-else-if="row.status === 'SETTLED'" class="nd-done">已结算</span>
+              <span v-else class="nd-wait">待条件满足</span>
+            </template>
+          </el-table-column>
+        </el-table>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          生成 / 重算 / 确认记录
+          <span class="view-tip">只追加不改写：每条记录留存当时的合同金额、报验结论与船舶状态，可解释每一次状态变化</span>
+        </div>
+        <el-table :data="payment.logs" size="small" v-if="payment.logs.length">
+          <el-table-column label="时间" width="150">
+            <template #default="{ row }">{{ fmtTime(row.createdAt) }}</template>
+          </el-table-column>
+          <el-table-column prop="nodeName" label="节点" width="90" />
+          <el-table-column prop="actionName" label="动作" width="80" />
+          <el-table-column prop="operator" label="操作者 / 触发" width="160" show-overflow-tooltip />
+          <el-table-column label="合同金额" width="90">
+            <template #default="{ row }">{{ row.contractAmount ?? '-' }}</template>
+          </el-table-column>
+          <el-table-column label="节点金额" width="90">
+            <template #default="{ row }">{{ row.nodeAmount ?? '-' }}</template>
+          </el-table-column>
+          <el-table-column label="船舶状态" width="80">
+            <template #default="{ row }">{{ row.vesselStatusName || '-' }}</template>
+          </el-table-column>
+          <el-table-column label="当时报验结论" width="170">
+            <template #default="{ row }">{{ fmtSurvey(row.surveySummary) }}</template>
+          </el-table-column>
+          <el-table-column label="当时阻塞" width="180">
+            <template #default="{ row }">{{ fmtBlockers(row.blockers) }}</template>
+          </el-table-column>
+          <el-table-column label="结果" width="80">
+            <template #default="{ row }">{{ row.resultName || '-' }}</template>
+          </el-table-column>
+          <el-table-column prop="note" label="说明" show-overflow-tooltip />
+        </el-table>
+        <div class="empty-tip" v-else>还没有记录</div>
+      </section>
+    </div>
+
+    <!-- ============ 单船分页 ============ -->
+    <div v-else-if="vesselId && detail">
       <section class="panel">
         <div class="panel-title">
           {{ detail.vessel.vesselName }}
@@ -207,9 +392,17 @@ onMounted(load)
           <div class="cc-amount">{{ contract.amount }} <span>万元</span></div>
           <div class="cc-line">签订 {{ contract.signDate || '-' }} · 交船 {{ contract.deliveryDate || '-' }}</div>
           <div class="cc-line" v-if="contract.settleRef">结算依据：{{ contract.settleRef }}</div>
+          <div class="cc-line" v-if="contract.paymentSummary && contract.paymentSummary.generated">
+            付款 {{ contract.paymentSummary.settledNodes }}/{{ contract.paymentSummary.totalNodes }} 节点 · 已结 {{ contract.paymentSummary.paidAmount }} 万元
+            <template v-if="contract.paymentSummary.pendingNodes">· 待结算 {{ contract.paymentSummary.pendingNodes }} 节点</template>
+          </div>
+          <div class="cc-line cc-blocked" v-if="contract.paymentSummary && contract.paymentSummary.generated && contract.paymentSummary.blockers.length">
+            阻塞：{{ contract.paymentSummary.blockers[0].message }}<template v-if="contract.paymentSummary.blockers.length > 1"> 等 {{ contract.paymentSummary.blockers.length }} 项</template>
+          </div>
           <div class="cc-note">{{ contract.note }}</div>
           <div class="cc-actions">
             <el-button size="small" type="primary" plain @click="advanceContract(contract)">推进状态</el-button>
+            <el-button v-if="contract.paymentSummary && contract.paymentSummary.generated" size="small" @click="openContract(contract)">付款节点</el-button>
           </div>
         </div>
         <div class="empty-tip" v-if="!detail.contracts.length">这艘船还没有合同</div>
@@ -288,7 +481,7 @@ onMounted(load)
       </section>
     </div>
 
-    <!-- 时间轴总览 -->
+    <!-- ============ 时间轴总览 ============ -->
     <div v-else>
       <div class="grid-2">
         <section class="panel">
@@ -321,7 +514,7 @@ onMounted(load)
         <section class="panel">
           <div class="panel-title">
             合同信息卡
-            <span class="view-tip">草拟 → 已签 → 履行中 → 已结算</span>
+            <span class="view-tip">草拟 → 已签 → 履行中 → 已结算 · 履行中起按付款节点结算</span>
           </div>
           <div class="contract-cards single">
             <div v-for="contract in contracts" :key="contract.id" class="contract-card" :style="{ borderTopColor: contractColor(contract.status) }">
@@ -333,8 +526,16 @@ onMounted(load)
               <div class="cc-amount">{{ contract.amount }} <span>万元</span></div>
               <div class="cc-line">签订 {{ contract.signDate || '-' }} · 交船 {{ contract.deliveryDate || '-' }}</div>
               <div class="cc-line" v-if="contract.settleRef">结算依据：{{ contract.settleRef }}</div>
+              <div class="cc-line" v-if="contract.paymentSummary && contract.paymentSummary.generated">
+                付款 {{ contract.paymentSummary.settledNodes }}/{{ contract.paymentSummary.totalNodes }} 节点 · 已结 {{ contract.paymentSummary.paidAmount }} 万元
+                <template v-if="contract.paymentSummary.pendingNodes">· 待结算 {{ contract.paymentSummary.pendingNodes }} 节点</template>
+              </div>
+              <div class="cc-line cc-blocked" v-if="contract.paymentSummary && contract.paymentSummary.generated && contract.paymentSummary.blockers.length">
+                阻塞：{{ contract.paymentSummary.blockers[0].message }}<template v-if="contract.paymentSummary.blockers.length > 1"> 等 {{ contract.paymentSummary.blockers.length }} 项</template>
+              </div>
               <div class="cc-actions">
                 <el-button size="small" type="primary" plain @click="advanceContract(contract)">推进状态</el-button>
+                <el-button v-if="contract.paymentSummary && contract.paymentSummary.generated" size="small" @click="openContract(contract)">付款节点</el-button>
               </div>
             </div>
             <div class="empty-tip" v-if="!contracts.length">还没有合同</div>
@@ -432,12 +633,31 @@ onMounted(load)
 .cc-amount { font-size: 20px; font-weight: 800; color: var(--primary-deep); margin-top: 6px; }
 .cc-amount span { font-size: 11px; font-weight: 400; color: var(--ink-dim); }
 .cc-line { font-size: 11px; color: var(--ink-dim); margin-top: 3px; }
+.cc-line.cc-blocked { color: var(--fail); }
 .cc-note { font-size: 11px; color: var(--ink-soft); margin-top: 4px; }
-.cc-actions { margin-top: 8px; }
+.cc-actions { margin-top: 8px; display: flex; gap: 6px; }
 
 .vs-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px 14px; }
 .vs-grid .k { font-size: 11px; color: var(--ink-dim); display: block; }
 .vs-grid b { font-size: 13px; }
 
 .link { color: var(--primary-deep); font-weight: 700; text-decoration: underline dotted; cursor: pointer; }
+
+.op-box { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+
+.pay-blockers {
+  margin-top: 10px;
+  border: 1px solid #f3c2c2;
+  background: #fdf3f3;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.pb-title { font-size: 12px; font-weight: 800; color: var(--fail); }
+.pb-item { font-size: 11.5px; color: var(--ink-soft); margin-top: 3px; }
+
+.nd-blocker { font-size: 11.5px; color: var(--fail); }
+.nd-settled { font-size: 11.5px; color: var(--pass); }
+.nd-ok { font-size: 11.5px; color: var(--slipway); }
+.nd-done { font-size: 11.5px; color: var(--pass); font-weight: 700; }
+.nd-wait { font-size: 11.5px; color: var(--ink-dim); }
 </style>

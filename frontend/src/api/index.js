@@ -49,6 +49,9 @@ const vessel = {
   updateContract: (id, data) => call(http.put(`/vessel/contracts/${id}`, data)),
   advanceContract: (id) => call(http.post(`/vessel/contracts/${id}/advance`)),
   removeContract: (id) => call(http.delete(`/vessel/contracts/${id}`)),
+  contractPayment: (id) => call(http.get(`/vessel/contracts/${id}/payment`)),
+  confirmPayment: (nodeId, operator) =>
+    call(http.post(`/vessel/contracts/payments/${nodeId}/confirm?operator=${encodeURIComponent(operator || '')}`)),
 
   owners: () => call(http.get('/vessel/owners')),
   createOwner: (data) => call(http.post('/vessel/owners', data)),

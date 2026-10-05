@@ -25,8 +25,10 @@ import com.shipyard.dock.repository.VesselRepository;
 /**
  * 模块二（下）：修造合同。
  *
- * <p>规则：① 合同编号唯一；② 合同金额必须 &gt; 0；③ 状态按 草拟 → 已签 → 履行中 → 已结算
- * 逐级流转；④ 结算前必须引用至少一次报验通过记录。</p>
+ * <p>规则：① 合同编号唯一；② 合同金额必须 &gt; 0（且不得低于已结算金额合计）；
+ * ③ 状态按 草拟 → 已签 → 履行中 → 已结算 逐级流转；
+ * ④ 进入履行中即进入结算流程：按模板生成分期付款节点，付款节点依据合同金额、
+ * 已完成的报验结论与当前船舶状态计算；⑤ 全部付款节点确认结算后合同才能整体结算。</p>
  */
 @Service
 public class ContractService {
@@ -34,21 +36,27 @@ public class ContractService {
     private final ContractRepository contractRepository;
     private final VesselRepository vesselRepository;
     private final SurveyRepository surveyRepository;
+    private final ContractPaymentService paymentService;
 
     public ContractService(ContractRepository contractRepository, VesselRepository vesselRepository,
-            SurveyRepository surveyRepository) {
+            SurveyRepository surveyRepository, ContractPaymentService paymentService) {
         this.contractRepository = contractRepository;
         this.vesselRepository = vesselRepository;
         this.surveyRepository = surveyRepository;
+        this.paymentService = paymentService;
     }
 
     public List<Contract> list() {
-        return contractRepository.findAllByOrderByIdAsc();
+        List<Contract> contracts = contractRepository.findAllByOrderByIdAsc();
+        paymentService.attachSummary(contracts);
+        return contracts;
     }
 
     public Contract get(Long id) {
-        return contractRepository.findById(id)
+        Contract contract = contractRepository.findById(id)
                 .orElseThrow(() -> new BizException("合同不存在：" + id));
+        paymentService.attachSummary(List.of(contract));
+        return contract;
     }
 
     @Transactional
@@ -74,11 +82,17 @@ public class ContractService {
         if (!Dict.isValidContractStatus(contract.getStatus())) {
             throw new BizException("合同状态非法：" + contract.getStatus());
         }
-        if ("SETTLED".equals(contract.getStatus())) {
-            checkSettle(contract);
-        }
+        contract.setPaidAmount(BigDecimal.ZERO);
         contract.setCreatedAt(LocalDateTime.now());
-        return contractRepository.save(contract);
+        Contract saved = contractRepository.save(contract);
+        if ("PERFORMING".equals(saved.getStatus())) {
+            paymentService.ensureNodes(saved);
+        }
+        if ("SETTLED".equals(saved.getStatus())) {
+            completeSettlement(saved);
+        }
+        paymentService.attachSummary(List.of(saved));
+        return saved;
     }
 
     @Transactional
@@ -97,6 +111,7 @@ public class ContractService {
                     + " 直接变为 " + Dict.contractStatusName(request.getStatus())
                     + "（草拟 → 已签 → 履行中 → 已结算，逐级推进）");
         }
+        BigDecimal oldAmount = contract.getAmount();
         applyPartial(contract, request);
         if (request.getVesselId() != null) {
             bindVessel(contract);
@@ -104,16 +119,33 @@ public class ContractService {
         if (contract.getAmount() == null || contract.getAmount().compareTo(BigDecimal.ZERO) <= 0) {
             throw new BizException("合同金额必须大于 0");
         }
-        if ("SETTLED".equals(contract.getStatus()) && contract.getSettledAt() == null) {
-            checkSettle(contract);
+        // 已完成的付款节点不可倒改：合同金额不得低于已结算金额合计
+        BigDecimal settledSum = paymentService.settledSum(id);
+        if (contract.getAmount().compareTo(settledSum) < 0) {
+            throw new BizException("合同金额不能小于已结算金额合计 " + settledSum
+                    + " 万元（已完成的付款节点不可倒改）");
         }
-        return contractRepository.save(contract);
+        if ("SETTLED".equals(contract.getStatus()) && contract.getSettledAt() == null) {
+            completeSettlement(contract);
+        }
+        Contract saved = contractRepository.save(contract);
+        if ("PERFORMING".equals(saved.getStatus())) {
+            paymentService.ensureNodes(saved);
+        }
+        // 合同金额变更：未结算节点按新金额重算，已结算节点保持历史金额
+        if (request.getAmount() != null
+                && (oldAmount == null || saved.getAmount().compareTo(oldAmount) != 0)) {
+            paymentService.recalcForContract(id, "合同金额由 " + oldAmount + " 万元变更为 " + saved.getAmount() + " 万元");
+        }
+        paymentService.attachSummary(List.of(saved));
+        return saved;
     }
 
-    /** 逐级推进合同状态；推进到已结算时要校验报验通过记录 */
+    /** 逐级推进合同状态；进入履行中生成付款节点，推进到已结算要求全部付款节点已结算 */
     @Transactional
     public Contract advance(Long id) {
-        Contract contract = get(id);
+        Contract contract = contractRepository.findByIdForUpdate(id)
+                .orElseThrow(() -> new BizException("合同不存在：" + id));
         int index = Dict.CONTRACT_FLOW.indexOf(contract.getStatus());
         if (index < 0 || index + 1 >= Dict.CONTRACT_FLOW.size()) {
             throw new BizException("合同 " + contract.getContractNo() + " 已处于终态「"
@@ -121,10 +153,15 @@ public class ContractService {
         }
         String next = Dict.CONTRACT_FLOW.get(index + 1);
         contract.setStatus(next);
-        if ("SETTLED".equals(next)) {
-            checkSettle(contract);
+        Contract saved = contractRepository.save(contract);
+        if ("PERFORMING".equals(next)) {
+            paymentService.ensureNodes(saved);
         }
-        return contractRepository.save(contract);
+        if ("SETTLED".equals(next)) {
+            completeSettlement(saved);
+        }
+        paymentService.attachSummary(List.of(saved));
+        return saved;
     }
 
     @Transactional
@@ -141,6 +178,7 @@ public class ContractService {
     public Map<String, Object> board() {
         Map<String, Object> data = new LinkedHashMap<>();
         List<Contract> contracts = contractRepository.findAllByOrderByIdAsc();
+        paymentService.attachSummary(contracts);
         data.put("contracts", contracts);
         data.put("statuses", contractRepository.statByStatus());
         List<Map<String, Object>> statusMeta = new ArrayList<>();
@@ -156,20 +194,18 @@ public class ContractService {
         return data;
     }
 
-    /** 结算前置校验：必须引用至少一次报验通过记录 */
-    private void checkSettle(Contract contract) {
-        if (contract.getVesselId() == null) {
-            throw new BizException("合同未绑定船舶，不能结算");
-        }
-        List<Survey> passed = surveyRepository.findPassedOfVessel(contract.getVesselId());
-        if (passed.isEmpty()) {
-            Vessel vessel = vesselRepository.findById(contract.getVesselId()).orElse(null);
-            throw new BizException("合同 " + contract.getContractNo() + " 结算失败："
-                    + (vessel == null ? "该船" : vessel.getVesselName())
-                    + " 还没有任何一条报验通过记录，结算前必须引用至少一次报验通过");
-        }
+    /**
+     * 合同整体结算：全部付款节点必须已确认结算（结算前必须引用至少一次报验通过的规则
+     * 由交验进度款节点承载），结算合计必须等于合同金额；通过后记录结算时间与依据单号。
+     */
+    private void completeSettlement(Contract contract) {
+        paymentService.ensureNodes(contract);
+        paymentService.requireAllSettled(contract);
         contract.setSettledAt(LocalDateTime.now());
-        contract.setSettleRef(passed.get(0).getSurveyNo());
+        List<Survey> passed = contract.getVesselId() == null
+                ? List.of()
+                : surveyRepository.findPassedOfVessel(contract.getVesselId());
+        contract.setSettleRef(passed.isEmpty() ? null : passed.get(0).getSurveyNo());
     }
 
     private void apply(Contract contract, ContractRequest request) {

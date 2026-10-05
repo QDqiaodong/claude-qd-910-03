@@ -3,6 +3,7 @@ package com.shipyard.dock.domain;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.util.Map;
 
 import com.shipyard.dock.common.Dict;
 
@@ -56,6 +57,10 @@ public class Contract {
     @Column(name = "amount", precision = 14, scale = 2)
     private BigDecimal amount;
 
+    /** 已结算金额（万元）：付款节点确认时在同一事务内累加，与节点状态同生共死 */
+    @Column(name = "paid_amount", precision = 14, scale = 2)
+    private BigDecimal paidAmount;
+
     @Column(name = "sign_date")
     private LocalDate signDate;
 
@@ -79,6 +84,13 @@ public class Contract {
 
     @Column(name = "created_at")
     private LocalDateTime createdAt;
+
+    /**
+     * 付款节点结算摘要（节点进度 / 已结算金额 / 当前阻塞项），由服务层填充。
+     * 合同详情、船舶合同列表与报验详情都带同一份摘要，保证三处口径一致。
+     */
+    @Transient
+    private Map<String, Object> paymentSummary;
 
     @Transient
     public String getContractTypeName() {

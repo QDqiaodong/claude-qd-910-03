@@ -16,12 +16,14 @@ import org.springframework.util.StringUtils;
 import com.shipyard.dock.common.BizException;
 import com.shipyard.dock.common.Dict;
 import com.shipyard.dock.domain.Block;
+import com.shipyard.dock.domain.Contract;
 import com.shipyard.dock.domain.PunchItem;
 import com.shipyard.dock.domain.Survey;
 import com.shipyard.dock.dto.PunchItemRequest;
 import com.shipyard.dock.dto.SurveyRequest;
 import com.shipyard.dock.generation.CodeSequenceService;
 import com.shipyard.dock.repository.BlockRepository;
+import com.shipyard.dock.repository.ContractRepository;
 import com.shipyard.dock.repository.PunchItemRepository;
 import com.shipyard.dock.repository.SurveyRepository;
 
@@ -30,7 +32,9 @@ import com.shipyard.dock.repository.SurveyRepository;
  *
  * <p>规则：① 报验单号唯一（由 {@code @SurveyNo} + Hibernate {@code @ValueGenerationType} 生成）；
  * ② 结论只能 合格 / 让步 / 不合格；③ 判不合格必须至少开一条遗留项；
- * ④ 遗留项闭环前，所属分段不允许置为已交验。</p>
+ * ④ 遗留项闭环前，所属分段不允许置为已交验；
+ * ⑤ 报验补录 / 撤回 / 改判（含改为让步接收）都会触发关联合同付款节点的结算状态重算，
+ * 重算留痕且不影响已完成的付款节点。</p>
  */
 @Service
 public class SurveyService {
@@ -41,12 +45,17 @@ public class SurveyService {
     private final SurveyRepository surveyRepository;
     private final PunchItemRepository punchItemRepository;
     private final BlockRepository blockRepository;
+    private final ContractRepository contractRepository;
+    private final ContractPaymentService paymentService;
 
     public SurveyService(SurveyRepository surveyRepository, PunchItemRepository punchItemRepository,
-            BlockRepository blockRepository) {
+            BlockRepository blockRepository, ContractRepository contractRepository,
+            ContractPaymentService paymentService) {
         this.surveyRepository = surveyRepository;
         this.punchItemRepository = punchItemRepository;
         this.blockRepository = blockRepository;
+        this.contractRepository = contractRepository;
+        this.paymentService = paymentService;
     }
 
     public List<Survey> list() {
@@ -119,6 +128,9 @@ public class SurveyService {
                 punchItemRepository.save(punch);
             }
         }
+        // 报验补录：触发该船履行中合同的付款节点结算状态重算（同事务，留痕）
+        paymentService.recalcForVessel(saved.getVesselId(),
+                "报验补录 " + saved.getSurveyNo() + "（" + Dict.surveyResultName(saved.getResult()) + "）");
         return saved;
     }
 
@@ -142,6 +154,7 @@ public class SurveyService {
                 throw new BizException("报验判定为「不合格」，必须至少开一条遗留项");
             }
         }
+        String oldResult = survey.getResult();
         applyPartial(survey, request);
         Survey saved = surveyRepository.save(survey);
         if (request.getPunchItems() != null && !request.getPunchItems().isEmpty()) {
@@ -165,6 +178,13 @@ public class SurveyService {
                 punchItemRepository.save(punch);
             }
         }
+        // 报验结论变更（含改为让步接收）：触发该船履行中合同的付款节点结算状态重算（同事务，留痕）
+        String trigger = "报验更新 " + saved.getSurveyNo();
+        if (request.getResult() != null && !request.getResult().equals(oldResult)) {
+            trigger = "报验结论变更 " + saved.getSurveyNo() + "（" + Dict.surveyResultName(oldResult)
+                    + " → " + Dict.surveyResultName(saved.getResult()) + "）";
+        }
+        paymentService.recalcForVessel(saved.getVesselId(), trigger);
         return saved;
     }
 
@@ -176,7 +196,11 @@ public class SurveyService {
             throw new BizException("报验单 " + survey.getSurveyNo() + " 下还有 " + items.size()
                     + " 条遗留项，请先处理遗留项再删除");
         }
+        Long vesselId = survey.getVesselId();
+        String surveyNo = survey.getSurveyNo();
         surveyRepository.deleteById(id);
+        // 报验撤回：触发该船履行中合同的付款节点结算状态重算（同事务，留痕）
+        paymentService.recalcForVessel(vesselId, "报验撤回 " + surveyNo);
     }
 
     // ---------------- 遗留项 ----------------
@@ -306,13 +330,22 @@ public class SurveyService {
         return data;
     }
 
-    /** 报验单详情：报验单 + 遗留项 + 分段 */
+    /** 报验单详情：报验单 + 遗留项 + 分段 + 关联合同的付款结算状态（与合同详情、船舶合同列表同源） */
     public Map<String, Object> detail(Long id) {
         Survey survey = get(id);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("survey", survey);
         data.put("punchItems", punchItemRepository.findBySurveyIdOrderByIdAsc(id));
         blockRepository.findById(survey.getBlockId()).ifPresent(block -> data.put("block", block));
+        // 本单结论会影响这些合同的付款节点结算状态；此处与合同详情、船舶合同列表同一份实时评估
+        List<Contract> affected = new ArrayList<>();
+        for (Contract contract : contractRepository.findByVesselIdOrderByIdAsc(survey.getVesselId())) {
+            if (paymentService.hasNodes(contract.getId())) {
+                affected.add(contract);
+            }
+        }
+        paymentService.attachSummary(affected);
+        data.put("affectedContracts", affected);
         return data;
     }
 

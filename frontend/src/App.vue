@@ -56,7 +56,7 @@ const modules = [
   { path: '/erection', title: '搭载吊装', desc: '吊装时间戳序列 + 吊次借记卡', tip: '未开始/进行中/历史 · 检修联动' },
   { path: '/crane', title: '起重设备', desc: '检修停用联动排程 · 替代设备自动筛选', tip: '进行中不换机 · 历史不倒改' },
   { path: '/survey', title: '报验遗留', desc: '左右双栏对照 · 判定印章', tip: '不合格必开遗留项' },
-  { path: '/vessel', title: '船舶合同', desc: '时间轴 + 合同信息卡', tip: '结算需报验通过' },
+  { path: '/vessel', title: '船舶合同', desc: '时间轴 + 合同信息卡 · 付款节点结算', tip: '履行中起按节点结算' },
   { path: '/launch', title: '下水放行', desc: '放行台 + 放行单快照 · 阻塞逐条列明', tip: '签认后确认 · 船台同步释放' }
 ]
 

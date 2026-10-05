@@ -88,6 +88,41 @@ public final class Dict {
             "PERFORMING", "履行中",
             "SETTLED", "已结算");
 
+    // ---------------- 合同付款节点 ----------------
+    /** 付款节点模板：合同进入履行中（进入结算流程）时按序生成，比例合计 100% */
+    public static final List<String> PAYMENT_NODE_FLOW = List.of("SIGN", "SURVEY", "LAUNCH", "DELIVERY", "WARRANTY");
+
+    private static final Map<String, String> PAYMENT_NODE_NAME = Map.of(
+            "SIGN", "签订合同款",
+            "SURVEY", "交验进度款",
+            "LAUNCH", "下水进度款",
+            "DELIVERY", "交船尾款",
+            "WARRANTY", "质保金");
+
+    /** 节点应付比例（占合同金额）；最后一个节点按合同金额倒挤调平，保证合计精确等于合同金额 */
+    private static final Map<String, BigDecimal> PAYMENT_NODE_RATIO = Map.of(
+            "SIGN", new BigDecimal("0.20"),
+            "SURVEY", new BigDecimal("0.30"),
+            "LAUNCH", new BigDecimal("0.20"),
+            "DELIVERY", new BigDecimal("0.20"),
+            "WARRANTY", new BigDecimal("0.10"));
+
+    /** 待结算（条件未满足，带阻塞项） → 可结算（条件满足待确认） → 已结算（终态，重算不覆盖） */
+    public static final List<String> PAYMENT_NODE_STATUSES = List.of("PENDING", "DUE", "SETTLED");
+
+    private static final Map<String, String> PAYMENT_NODE_STATUS_NAME = Map.of(
+            "PENDING", "待结算",
+            "DUE", "可结算",
+            "SETTLED", "已结算");
+
+    /** 付款节点记录类型：生成节点 / 联动重算 / 确认结算 */
+    public static final List<String> PAYMENT_LOG_ACTIONS = List.of("GENERATE", "RECALC", "CONFIRM");
+
+    private static final Map<String, String> PAYMENT_LOG_ACTION_NAME = Map.of(
+            "GENERATE", "生成节点",
+            "RECALC", "联动重算",
+            "CONFIRM", "确认结算");
+
     // ---------------- 分段 ----------------
     public static final List<String> BLOCK_TYPES = List.of(
             "BOTTOM", "SIDE", "DECK", "BOW", "STERN", "SUPER");
@@ -342,6 +377,30 @@ public final class Dict {
     public static boolean canTransferContract(String from, String to) {
         int i = CONTRACT_FLOW.indexOf(from);
         return i >= 0 && i + 1 < CONTRACT_FLOW.size() && CONTRACT_FLOW.get(i + 1).equals(to);
+    }
+
+    public static boolean isValidPaymentNode(String code) {
+        return code != null && PAYMENT_NODE_NAME.containsKey(code);
+    }
+
+    public static String paymentNodeName(String code) {
+        return code == null ? "" : PAYMENT_NODE_NAME.getOrDefault(code, code);
+    }
+
+    public static BigDecimal paymentNodeRatio(String code) {
+        return code == null ? BigDecimal.ZERO : PAYMENT_NODE_RATIO.getOrDefault(code, BigDecimal.ZERO);
+    }
+
+    public static boolean isValidPaymentNodeStatus(String status) {
+        return status != null && PAYMENT_NODE_STATUS_NAME.containsKey(status);
+    }
+
+    public static String paymentNodeStatusName(String status) {
+        return status == null ? "" : PAYMENT_NODE_STATUS_NAME.getOrDefault(status, status);
+    }
+
+    public static String paymentLogActionName(String action) {
+        return action == null ? "" : PAYMENT_LOG_ACTION_NAME.getOrDefault(action, action);
     }
 
     public static boolean isValidBlockType(String type) {

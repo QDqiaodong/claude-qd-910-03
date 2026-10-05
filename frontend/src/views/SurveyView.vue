@@ -67,6 +67,15 @@ function openBlock(code, id) {
   emit('openTab', { path: '/block', title: code, params: { blockId: id } })
 }
 
+function openContract(contract) {
+  emit('openTab', {
+    path: '/vessel',
+    title: '合同 ' + contract.contractNo,
+    sub: contract.vesselName,
+    params: { contractId: contract.id }
+  })
+}
+
 function punchOf(surveyId) {
   return punchItems.value.filter((p) => p.surveyId === surveyId)
 }
@@ -178,6 +187,29 @@ onMounted(load)
         </el-table-column>
       </el-table>
       <div class="empty-tip" v-else>本单没有遗留项</div>
+
+      <div class="panel-title" style="margin-top:12px">
+        关联合同结算联动
+        <span class="view-tip">本单结论补录 / 撤回 / 改判会触发下列合同付款节点重算；此处与合同详情、船舶合同列表同源</span>
+      </div>
+      <div class="affected-list" v-if="(detail.affectedContracts || []).length">
+        <div v-for="c in detail.affectedContracts" :key="c.id" class="affected-card">
+          <div class="af-head">
+            <b class="link" @click="openContract(c)">{{ c.contractNo }}</b>
+            <span class="tag-line">{{ c.statusName }}</span>
+            <span class="af-vessel">{{ c.vesselNo }} {{ c.vesselName }}</span>
+            <span class="af-sum" v-if="c.paymentSummary">
+              付款 {{ c.paymentSummary.settledNodes }}/{{ c.paymentSummary.totalNodes }} 节点 · 已结 {{ c.paymentSummary.paidAmount }} 万元
+            </span>
+          </div>
+          <div v-if="c.paymentSummary && c.paymentSummary.blockers.length" class="af-blockers">
+            <div v-for="(b, i) in c.paymentSummary.blockers" :key="i" class="af-blocker">· 【{{ b.nodeName }}】{{ b.message }}</div>
+          </div>
+          <div v-else-if="c.paymentSummary && c.paymentSummary.allSettled" class="af-ok">全部付款节点已结算</div>
+          <div v-else-if="c.paymentSummary" class="af-ok">无阻塞：{{ c.paymentSummary.dueNodes }} 个节点可结算，待财务确认</div>
+        </div>
+      </div>
+      <div class="empty-tip" v-else>该船暂无进入结算流程（履行中）的合同，本单结论不影响付款节点</div>
     </section>
 
     <!-- 双栏对照 -->
@@ -359,6 +391,22 @@ onMounted(load)
 .detail-info .k { font-size: 11px; color: var(--ink-dim); display: block; }
 .detail-info b { font-size: 13px; }
 .link { color: var(--primary-deep); text-decoration: underline dotted; cursor: pointer; }
+
+.affected-list { display: flex; flex-direction: column; gap: 8px; }
+.affected-card {
+  border: 1px solid var(--line-strong);
+  border-left: 4px solid var(--slipway);
+  border-radius: 10px;
+  padding: 8px 11px;
+  background: #fff;
+}
+.af-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.af-head b { font-size: 12.5px; }
+.af-vessel { font-size: 11px; color: var(--ink-dim); }
+.af-sum { margin-left: auto; font-size: 11px; color: var(--ink-soft); font-weight: 700; }
+.af-blockers { margin-top: 5px; }
+.af-blocker { font-size: 11.5px; color: var(--fail); margin-top: 2px; }
+.af-ok { font-size: 11.5px; color: var(--pass); margin-top: 5px; }
 
 .punch-editor { border-top: 1px dashed var(--line-strong); margin-top: 6px; padding-top: 8px; }
 .pe-head { display: flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 700; }
