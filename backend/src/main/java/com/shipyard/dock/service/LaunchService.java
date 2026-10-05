@@ -73,13 +73,15 @@ public class LaunchService {
     private final ContractRepository contractRepository;
     private final SurveyRepository surveyRepository;
     private final PunchItemRepository punchItemRepository;
+    private final PaymentSettlementService settlementService;
     private final ObjectMapper objectMapper;
 
     public LaunchService(LaunchClearanceRepository clearanceRepository,
             LaunchClearanceCheckRepository checkRepository, VesselRepository vesselRepository,
             BerthRepository berthRepository, BlockRepository blockRepository,
             ContractRepository contractRepository, SurveyRepository surveyRepository,
-            PunchItemRepository punchItemRepository, ObjectMapper objectMapper) {
+            PunchItemRepository punchItemRepository, PaymentSettlementService settlementService,
+            ObjectMapper objectMapper) {
         this.clearanceRepository = clearanceRepository;
         this.checkRepository = checkRepository;
         this.vesselRepository = vesselRepository;
@@ -88,6 +90,7 @@ public class LaunchService {
         this.contractRepository = contractRepository;
         this.surveyRepository = surveyRepository;
         this.punchItemRepository = punchItemRepository;
+        this.settlementService = settlementService;
         this.objectMapper = objectMapper;
     }
 
@@ -357,6 +360,8 @@ public class LaunchService {
         clearanceRepository.save(sheet);
         appendCheck(sheet, "CONFIRM", vr, operator,
                 "确认下水放行：船舶置为已下水，船台 " + berth.getBerthNo() + " 已释放");
+        // 船舶已下水：同事务联动重算该船全部待结算付款节点（如下水款），已付款节点不动
+        settlementService.recalcByVesselStatus(vessel, operator);
         return detail(id);
     }
 

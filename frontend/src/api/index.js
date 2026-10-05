@@ -47,8 +47,16 @@ const vessel = {
   contract: (id) => call(http.get(`/vessel/contracts/${id}`)),
   createContract: (data) => call(http.post('/vessel/contracts', data)),
   updateContract: (id, data) => call(http.put(`/vessel/contracts/${id}`, data)),
-  advanceContract: (id) => call(http.post(`/vessel/contracts/${id}/advance`)),
+  advanceContract: (id, operator) =>
+    call(http.post(`/vessel/contracts/${id}/advance${operator ? '?operator=' + encodeURIComponent(operator) : ''}`)),
   removeContract: (id) => call(http.delete(`/vessel/contracts/${id}`)),
+
+  // 付款节点结算联动：状态与阻塞项全部由后端按 合同金额 / 报验结论 / 船舶状态 计算
+  contractSettlement: (id) => call(http.get(`/vessel/contracts/${id}/settlement`)),
+  recheckSettlement: (id, operator) =>
+    call(http.post(`/vessel/contracts/${id}/recheck?operator=${encodeURIComponent(operator)}`)),
+  confirmPayment: (nodeId, operator) =>
+    call(http.post(`/vessel/payment-nodes/${nodeId}/confirm?operator=${encodeURIComponent(operator)}`)),
 
   owners: () => call(http.get('/vessel/owners')),
   createOwner: (data) => call(http.post('/vessel/owners', data)),

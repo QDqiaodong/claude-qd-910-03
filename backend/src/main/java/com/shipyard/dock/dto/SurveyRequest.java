@@ -21,6 +21,9 @@ public class SurveyRequest {
     private String result;
     private String remark;
 
+    /** 操作人：报验补录 / 改判 / 撤回触发结算重算时的操作者痕迹（不填记为报验台账） */
+    private String operator;
+
     /** 判不合格时随单开出的遗留项 */
     private List<PunchItemRequest> punchItems = new ArrayList<>();
 }

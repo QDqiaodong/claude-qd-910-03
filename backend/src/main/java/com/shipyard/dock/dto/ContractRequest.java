@@ -18,4 +18,7 @@ public class ContractRequest {
     private LocalDate deliveryDate;
     private String status;
     private String note;
+
+    /** 操作人：进入结算 / 金额调整等动作的操作者痕迹（不填记为系统联动） */
+    private String operator;
 }

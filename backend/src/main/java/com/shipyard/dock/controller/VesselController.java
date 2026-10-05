@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.shipyard.dock.common.ApiResponse;
@@ -21,6 +22,7 @@ import com.shipyard.dock.dto.OwnerRequest;
 import com.shipyard.dock.dto.VesselRequest;
 import com.shipyard.dock.service.ContractService;
 import com.shipyard.dock.service.OwnerService;
+import com.shipyard.dock.service.PaymentSettlementService;
 import com.shipyard.dock.service.VesselService;
 
 /**
@@ -35,11 +37,14 @@ public class VesselController {
     private final VesselService vesselService;
     private final ContractService contractService;
     private final OwnerService ownerService;
+    private final PaymentSettlementService paymentSettlementService;
 
-    public VesselController(VesselService vesselService, ContractService contractService, OwnerService ownerService) {
+    public VesselController(VesselService vesselService, ContractService contractService,
+            OwnerService ownerService, PaymentSettlementService paymentSettlementService) {
         this.vesselService = vesselService;
         this.contractService = contractService;
         this.ownerService = ownerService;
+        this.paymentSettlementService = paymentSettlementService;
     }
 
     // ---------------- 船舶 ----------------
@@ -107,16 +112,44 @@ public class VesselController {
         return ApiResponse.success("合同已更新", contractService.update(id, request));
     }
 
-    /** 推进一级合同状态：草拟 → 已签 → 履行中 → 已结算 */
+    /** 推进一级合同状态：草拟 → 已签 → 履行中（生成付款节点）→ 已结算（末笔付款自动完成） */
     @PostMapping("/contracts/{id}/advance")
-    public ApiResponse<Contract> contractAdvance(@PathVariable Long id) {
-        return ApiResponse.success("合同状态已推进", contractService.advance(id));
+    public ApiResponse<Contract> contractAdvance(@PathVariable Long id,
+            @RequestParam(required = false) String operator) {
+        return ApiResponse.success("合同状态已推进", contractService.advance(id, operator));
     }
 
     @DeleteMapping("/contracts/{id}")
     public ApiResponse<Void> contractDelete(@PathVariable Long id) {
         contractService.delete(id);
         return ApiResponse.success("合同已删除", null);
+    }
+
+    // ---------------- 合同付款节点（结算联动） ----------------
+
+    /** 合同结算详情：合同 + 全部付款节点（实时状态 / 阻塞 / 冻结证据）+ 只追加的操作记录 */
+    @GetMapping("/contracts/{id}/settlement")
+    public ApiResponse<Map<String, Object>> contractSettlement(@PathVariable Long id) {
+        return ApiResponse.success(paymentSettlementService.contractSettlement(id));
+    }
+
+    /** 手工复核：按当前合同金额 / 报验结论 / 船舶状态重算待结算节点（已付款节点不动） */
+    @PostMapping("/contracts/{id}/recheck")
+    public ApiResponse<Map<String, Object>> contractRecheck(@PathVariable Long id,
+            @RequestParam String operator) {
+        return ApiResponse.success("已按最新数据复核付款节点",
+                paymentSettlementService.recheckContract(id, operator));
+    }
+
+    /**
+     * 确认付款节点：后端按合同金额 × 比例、有效报验结论、当前船舶状态、前序节点重新校验，
+     * 通过才扣减合同已付金额并把节点置为已付款；并发 / 重试只有一笔有效结果，
+     * 失败整体回滚但保留操作者驳回痕迹。
+     */
+    @PostMapping("/payment-nodes/{nodeId}/confirm")
+    public ApiResponse<Map<String, Object>> confirmPayment(@PathVariable Long nodeId,
+            @RequestParam String operator) {
+        return ApiResponse.success("付款节点已确认", paymentSettlementService.confirm(nodeId, operator));
     }
 
     // ---------------- 船东名录 ----------------

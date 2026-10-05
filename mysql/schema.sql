@@ -15,6 +15,8 @@ CREATE DATABASE IF NOT EXISTS shipyard_dock
 USE shipyard_dock;
 
 SET FOREIGN_KEY_CHECKS = 0;
+DROP TABLE IF EXISTS contract_payment_log;
+DROP TABLE IF EXISTS contract_payment_node;
 DROP TABLE IF EXISTS berth_move_log;
 DROP TABLE IF EXISTS launch_clearance_check;
 DROP TABLE IF EXISTS launch_clearance;
@@ -77,7 +79,9 @@ CREATE TABLE vessel (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------- 修造合同 ----------------
--- 状态流转：DRAFT 草拟 → SIGNED 已签 → PERFORMING 履行中 → SETTLED 已结算
+-- 状态流转：DRAFT 草拟 → SIGNED 已签 → PERFORMING 履行中（进入结算流程，按付款节点逐笔结算）
+--        → SETTLED 已结算（全部付款节点已付款，由末笔确认自动置位）
+-- paid_amount 是已付款节点冻结金额之和，只随确认付款这一个动作增长。
 CREATE TABLE contract (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     contract_no VARCHAR(24) NOT NULL UNIQUE,
@@ -88,6 +92,7 @@ CREATE TABLE contract (
     owner_name VARCHAR(48),
     contract_type VARCHAR(16),
     amount DECIMAL(14,2),
+    paid_amount DECIMAL(14,2) DEFAULT 0.00,
     sign_date DATE,
     delivery_date DATE,
     status VARCHAR(16),
@@ -95,6 +100,70 @@ CREATE TABLE contract (
     settle_ref VARCHAR(32),
     note VARCHAR(64),
     created_at DATETIME
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---------------- 合同付款节点 ----------------
+-- 合同进入结算流程（履行中）后按合同类型模板生成（新造：开工/上船台/下水/交船；
+-- 修理：进厂开工/验收；改装：开工/改装完工/交付验收）。
+-- PENDING 待结算：应付金额随合同金额实时计算，latest_verdict/blockers_json 随报验补录、
+--                 撤回、让步改判与船舶状态变化联动重算，条件不满足停留待结算。
+-- PAID 已付款：evidence_json 冻结付款时的合同金额、报验结论、船舶状态与前序节点，
+--              之后任何刷新都不得倒改（历史不被悄悄覆盖）。
+-- version 乐观锁 + 确认时行级悲观锁：多人同时确认 / 网络重试同一节点只有一笔有效结果。
+CREATE TABLE contract_payment_node (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    node_no VARCHAR(40) NOT NULL UNIQUE,
+    contract_id BIGINT NOT NULL,
+    contract_no VARCHAR(24),
+    vessel_id BIGINT,
+    vessel_no VARCHAR(24),
+    vessel_name VARCHAR(48),
+    seq INT NOT NULL,
+    node_name VARCHAR(32),
+    ratio INT NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    required_vessel_status VARCHAR(16),
+    required_accept_surveys INT,
+    amount_due DECIMAL(14,2),
+    amount_paid DECIMAL(14,2),
+    frozen_contract_amount DECIMAL(14,2),
+    latest_verdict VARCHAR(16),
+    latest_checked_at DATETIME,
+    blockers_json TEXT,
+    evidence_json TEXT,
+    settle_ref VARCHAR(32),
+    confirmed_by VARCHAR(32),
+    confirmed_at DATETIME,
+    created_at DATETIME,
+    version INT NOT NULL DEFAULT 0,
+    KEY idx_payment_contract (contract_id, seq),
+    KEY idx_payment_vessel (vessel_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---------------- 合同付款节点操作记录（只追加，责任追溯） ----------------
+-- action：CREATE 进入结算生成 / RECALC 报验或船舶状态联动重算 / CONFIRM 确认付款 / CONFIRM_REJECT 确认被驳回
+-- evidence_json 记录当时合同金额、有效报验结论条数与清单、船舶状态、前序节点；
+-- blockers_json 记录当时逐条阻塞项。旧记录永不覆盖，事后能解释每笔款的计算依据。
+CREATE TABLE contract_payment_log (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    contract_id BIGINT NOT NULL,
+    node_id BIGINT,
+    node_no VARCHAR(40),
+    vessel_id BIGINT,
+    action VARCHAR(24) NOT NULL,
+    source_type VARCHAR(24),
+    source_ref VARCHAR(128),
+    verdict VARCHAR(16),
+    contract_amount DECIMAL(14,2),
+    accept_survey_count INT,
+    vessel_status VARCHAR(16),
+    blockers_json TEXT,
+    evidence_json TEXT,
+    operator VARCHAR(32),
+    note VARCHAR(255),
+    created_at DATETIME,
+    KEY idx_paylog_contract (contract_id),
+    KEY idx_paylog_node (node_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------- 船台 / 船坞 / 舾装码头 ----------------
@@ -380,15 +449,15 @@ INSERT INTO vessel (id, vessel_no, reg_no, vessel_name, vessel_type, owner_id, o
 (7, 'HN2607', '2026CS0255', '华通远景',   'BULK',        1, '华通海运集团有限公司',       190.00, 32.26, 18.00, 33100.00, 78000.00, 2026, 'IN_YARD',   '同系列第二条，尚未排船台',      UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 58 DAY),
 (8, 'HN2608', '2026TK0266', '江海油运6',  'TANKER',      4, '江海联运物流股份公司',       166.00, 28.00, 15.40, 24500.00, 52000.00, 2026, 'IN_YARD',   '成品油船，坞修待排期',          UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 54 DAY);
 
-INSERT INTO contract (id, contract_no, vessel_id, vessel_no, vessel_name, owner_id, owner_name, contract_type, amount, sign_date, delivery_date, status, settled_at, settle_ref, note, created_at) VALUES
-(1, 'CT-2026-011', 1, 'HN2601', '华通之星',  1, '华通海运集团有限公司',       'NEW_BUILD',  38600.00, '2026-01-18', '2026-09-30', 'PERFORMING', NULL, NULL, '含机电舾装总包',                       UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 80 DAY),
-(2, 'CT-2026-012', 2, 'HN2602', '北远泰山',  2, '北方远洋船务有限公司',       'NEW_BUILD',  41200.00, '2026-01-25', '2026-10-15', 'PERFORMING', NULL, NULL, '分段建造 + 船台合拢',                  UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 76 DAY),
-(3, 'CT-2026-013', 3, 'HN2603', '蓝海油运',  3, '蓝海湾航运（香港）有限公司', 'REPAIR',      2600.00, '2026-03-02', '2026-05-20', 'SETTLED',    UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 12 DAY, 'SV-20260425-001', '坞检修理，已凭报验通过单结算', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 64 DAY),
-(4, 'CT-2026-014', 4, 'HN2604', '江海集运',  4, '江海联运物流股份公司',       'REPAIR',      1850.00, '2026-03-10', '2026-06-10', 'SIGNED',     NULL, NULL, '螺旋桨与舵系检修',                     UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
-(5, 'CT-2026-015', 5, 'HN2605', '太湖浚1',   5, '太湖疏浚工程有限公司',       'CONVERSION',  3200.00, '2025-11-08', '2026-04-30', 'PERFORMING', NULL, NULL, '船体加长 12m 改装',                    UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 56 DAY),
-(6, 'CT-2026-016', 6, 'HN2606', '星海快航',  6, '星海渔业集团股份公司',       'NEW_BUILD',   5600.00, '2026-04-02', '2026-12-20', 'DRAFT',      NULL, NULL, '条款待船东确认',                       UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 50 DAY),
-(7, 'CT-2026-017', 1, 'HN2601', '华通之星',  1, '华通海运集团有限公司',       'REPAIR',       980.00, '2026-04-05', '2026-07-15', 'SETTLED',    UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 6 DAY,  'SV-20260427-001', '艏部球鼻艏磕碰修理，已结算',     UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 46 DAY),
-(8, 'CT-2026-018', 8, 'HN2608', '江海油运6', 4, '江海联运物流股份公司',       'REPAIR',      1450.00, '2026-04-12', '2026-08-30', 'SIGNED',     NULL, NULL, '货油舱涂层翻修',                       UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 40 DAY);
+INSERT INTO contract (id, contract_no, vessel_id, vessel_no, vessel_name, owner_id, owner_name, contract_type, amount, paid_amount, sign_date, delivery_date, status, settled_at, settle_ref, note, created_at) VALUES
+(1, 'CT-2026-011', 1, 'HN2601', '华通之星',  1, '华通海运集团有限公司',       'NEW_BUILD',  38600.00, 0.00,    '2026-01-18', '2026-09-30', 'PERFORMING', NULL, NULL, '含机电舾装总包',                       UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 80 DAY),
+(2, 'CT-2026-012', 2, 'HN2602', '北远泰山',  2, '北方远洋船务有限公司',       'NEW_BUILD',  41200.00, 0.00,    '2026-01-25', '2026-10-15', 'PERFORMING', NULL, NULL, '分段建造 + 船台合拢',                  UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 76 DAY),
+(3, 'CT-2026-013', 3, 'HN2603', '蓝海油运',  3, '蓝海湾航运（香港）有限公司', 'REPAIR',      2600.00, 2600.00, '2026-03-02', '2026-05-20', 'SETTLED',    UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 10 DAY, 'SV-20260428-002', '坞检修理，已凭报验通过单逐笔结算',     UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 64 DAY),
+(4, 'CT-2026-014', 4, 'HN2604', '江海集运',  4, '江海联运物流股份公司',       'REPAIR',      1850.00, 0.00,    '2026-03-10', '2026-06-10', 'SIGNED',     NULL, NULL, '螺旋桨与舵系检修',                     UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(5, 'CT-2026-015', 5, 'HN2605', '太湖浚1',   5, '太湖疏浚工程有限公司',       'CONVERSION',  3200.00, 0.00,    '2025-11-08', '2026-04-30', 'PERFORMING', NULL, NULL, '船体加长 12m 改装',                    UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 56 DAY),
+(6, 'CT-2026-016', 6, 'HN2606', '星海快航',  6, '星海渔业集团股份公司',       'NEW_BUILD',   5600.00, 0.00,    '2026-04-02', '2026-12-20', 'DRAFT',      NULL, NULL, '条款待船东确认',                       UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 50 DAY),
+(7, 'CT-2026-017', 1, 'HN2601', '华通之星',  1, '华通海运集团有限公司',       'REPAIR',       980.00, 980.00,  '2026-04-05', '2026-07-15', 'SETTLED',    UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 5 DAY,  'SV-20260428-001', '艏部球鼻艏磕碰修理，验收款已结',       UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 46 DAY),
+(8, 'CT-2026-018', 8, 'HN2608', '江海油运6', 4, '江海联运物流股份公司',       'REPAIR',      1450.00, 0.00,    '2026-04-12', '2026-08-30', 'SIGNED',     NULL, NULL, '货油舱涂层翻修',                       UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 40 DAY);
 
 INSERT INTO berth (id, berth_no, berth_name, berth_type, length_m, width_m, capacity_t, vessel_id, vessel_name, status, occupied_at, location, note, created_at) VALUES
 (1, 'BT-01', '一号船台',   'SLIPWAY', 240.00, 42.00, 120000.00, 1,    '华通之星', 'OCCUPIED',    UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 70 DAY, '厂区东岸', '主力船台，配 600t 龙门吊', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 120 DAY),
@@ -457,7 +526,10 @@ INSERT INTO survey (id, survey_no, block_id, block_code, vessel_id, vessel_no, s
 (7,  'SV-20260424-001', 8,  'SEG-HN2602-002', 2, 'HN2602', 'COATING',    UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 32 DAY, 'ABS',   '周立群', 'FAIL',       '舷侧外板漏涂两处，需补涂',        UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 32 DAY),
 (8,  'SV-20260425-001', 11, 'SEG-HN2603-002', 3, 'HN2603', 'DIMENSION',  UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 31 DAY, 'LR',    '孙佩林', 'PASS',       '边舱线型复测合格，同意进入搭载',  UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 31 DAY),
 (9,  'SV-20260426-001', 4,  'SEG-HN2601-004', 1, 'HN2601', 'WELD',       UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 30 DAY, 'CCS',   '钱广安', 'CONCESSION', '球鼻艏三处气孔，让步使用限期返修', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 30 DAY),
-(10, 'SV-20260427-001', 5,  'SEG-HN2601-005', 1, 'HN2601', 'WELD',       UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 29 DAY, 'CCS',   '孙佩林', 'PASS',       '右舷边舱胎上焊缝抽检合格',        UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 29 DAY);
+(10, 'SV-20260427-001', 5,  'SEG-HN2601-005', 1, 'HN2601', 'WELD',       UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 29 DAY, 'CCS',   '孙佩林', 'PASS',       '右舷边舱胎上焊缝抽检合格',            UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 29 DAY),
+-- 修理验收款要求 2 条有效报验结论：补齐两条历史合格报验（合同3 蓝海油运 / 合同7 华通之星球鼻艏修理）
+(11, 'SV-20260428-002', 12, 'SEG-HN2603-003', 3, 'HN2603', 'TIGHTNESS',  UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 26 DAY, 'LR',    '孙佩林', 'PASS',       '艏尖舱密性复验合格，同意验收交船',    UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 26 DAY),
+(12, 'SV-20260428-001', 4,  'SEG-HN2601-004', 1, 'HN2601', 'WELD',       UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 26 DAY, 'CCS',   '钱广安', 'PASS',       '球鼻艏让步项返修后 UT 复检合格',      UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 26 DAY);
 
 INSERT INTO punch_item (id, punch_no, survey_id, survey_no, block_id, block_code, title, description, severity, due_date, owner, status, closed_at, created_at) VALUES
 (1, 'PI-20260421-001-01', 4, 'SV-20260421-001', 10, 'SEG-HN2603-001', '双层底涂层膜厚不足', '实测 180μm 低于 250μm 要求，需整体扫砂重涂', 'MAJOR',    '2026-05-06', '王立柱', 'OPEN',       NULL,                                                UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 35 DAY),
@@ -484,6 +556,7 @@ INSERT INTO code_sequence (seq_key, seq_scope, seq_value, updated_at) VALUES
 ('SURVEY_NO', '20260425', 1, UTC_TIMESTAMP() + INTERVAL 8 HOUR),
 ('SURVEY_NO', '20260426', 1, UTC_TIMESTAMP() + INTERVAL 8 HOUR),
 ('SURVEY_NO', '20260427', 1, UTC_TIMESTAMP() + INTERVAL 8 HOUR),
+('SURVEY_NO', '20260428', 2, UTC_TIMESTAMP() + INTERVAL 8 HOUR),
 ('ERECTION_NO', 'HN2601', 4, UTC_TIMESTAMP() + INTERVAL 8 HOUR),
 ('ERECTION_NO', 'HN2602', 2, UTC_TIMESTAMP() + INTERVAL 8 HOUR),
 ('ERECTION_NO', 'HN2603', 2, UTC_TIMESTAMP() + INTERVAL 8 HOUR),
@@ -491,6 +564,76 @@ INSERT INTO code_sequence (seq_key, seq_scope, seq_value, updated_at) VALUES
 ('PUNCH_NO', '20260421-001', 3, UTC_TIMESTAMP() + INTERVAL 8 HOUR),
 ('PUNCH_NO', '20260424-001', 2, UTC_TIMESTAMP() + INTERVAL 8 HOUR),
 ('PUNCH_NO', '20260426-001', 2, UTC_TIMESTAMP() + INTERVAL 8 HOUR);
+
+-- ---------------- 合同付款节点（种子） ----------------
+-- 履行中合同：节点待结算，阻塞项由后端按 合同金额 / 报验结论 / 船舶状态 实时重算（这里给当前口径）；
+-- 已结算合同：两笔修理节点均已付款，证据快照冻结付款时金额、报验结论与船舶状态，历史不可倒改。
+INSERT INTO contract_payment_node (id, node_no, contract_id, contract_no, vessel_id, vessel_no, vessel_name, seq, node_name, ratio, status, required_vessel_status, required_accept_surveys, amount_due, amount_paid, frozen_contract_amount, latest_verdict, latest_checked_at, blockers_json, evidence_json, settle_ref, confirmed_by, confirmed_at, created_at, version) VALUES
+-- CT-2026-011 华通之星 新造 38600：开工款可付；上船台款仅差前序；下水 / 交船款差船舶状态与前序
+(1, 'PM-CT-2026-011-01', 1, 'CT-2026-011', 1, 'HN2601', '华通之星', 1, '开工款',   10, 'PENDING', 'IN_YARD',  1, 3860.00,  NULL, NULL, 'READY',   UTC_TIMESTAMP() + INTERVAL 8 HOUR, '[]', NULL, NULL, NULL, NULL, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 70 DAY, 0),
+(2, 'PM-CT-2026-011-02', 1, 'CT-2026-011', 1, 'HN2601', '华通之星', 2, '上船台款', 20, 'PENDING', 'IN_YARD',  2, 7720.00,  NULL, NULL, 'BLOCKED', UTC_TIMESTAMP() + INTERVAL 8 HOUR,
+ '[{"type":"PREV_NODE_UNPAID","typeName":"前序节点未付","refNo":"PM-CT-2026-011-01","message":"前序付款节点「开工款」（PM-CT-2026-011-01）尚未付款，付款节点须逐笔确认，不能跳付到「上船台款」"}]', NULL, NULL, NULL, NULL, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 70 DAY, 0),
+(3, 'PM-CT-2026-011-03', 1, 'CT-2026-011', 1, 'HN2601', '华通之星', 3, '下水款',   30, 'PENDING', 'LAUNCHED', 3, 11580.00, NULL, NULL, 'BLOCKED', UTC_TIMESTAMP() + INTERVAL 8 HOUR,
+ '[{"type":"VESSEL_STATUS","typeName":"船舶状态未达标","refNo":"HN2601","message":"付款节点「下水款」要求船舶至少为「已下水」，当前为「在厂」"},{"type":"PREV_NODE_UNPAID","typeName":"前序节点未付","refNo":"PM-CT-2026-011-02","message":"前序付款节点「上船台款」（PM-CT-2026-011-02）尚未付款，付款节点须逐笔确认，不能跳付到「下水款」"}]', NULL, NULL, NULL, NULL, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 70 DAY, 0),
+(4, 'PM-CT-2026-011-04', 1, 'CT-2026-011', 1, 'HN2601', '华通之星', 4, '交船款',   40, 'PENDING', 'DELIVERED',4, 15440.00, NULL, NULL, 'BLOCKED', UTC_TIMESTAMP() + INTERVAL 8 HOUR,
+ '[{"type":"VESSEL_STATUS","typeName":"船舶状态未达标","refNo":"HN2601","message":"付款节点「交船款」要求船舶至少为「已交付」，当前为「在厂」"},{"type":"PREV_NODE_UNPAID","typeName":"前序节点未付","refNo":"PM-CT-2026-011-03","message":"前序付款节点「下水款」（PM-CT-2026-011-03）尚未付款，付款节点须逐笔确认，不能跳付到「交船款」"}]', NULL, NULL, NULL, NULL, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 70 DAY, 0),
+-- CT-2026-012 北远泰山 新造 41200：仅 1 条让步接收，开工款可付，其余节点报验结论不足
+(5, 'PM-CT-2026-012-01', 2, 'CT-2026-012', 2, 'HN2602', '北远泰山', 1, '开工款',   10, 'PENDING', 'IN_YARD',  1, 4120.00,  NULL, NULL, 'READY',   UTC_TIMESTAMP() + INTERVAL 8 HOUR, '[]', NULL, NULL, NULL, NULL, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 66 DAY, 0),
+(6, 'PM-CT-2026-012-02', 2, 'CT-2026-012', 2, 'HN2602', '北远泰山', 2, '上船台款', 20, 'PENDING', 'IN_YARD',  2, 8240.00,  NULL, NULL, 'BLOCKED', UTC_TIMESTAMP() + INTERVAL 8 HOUR,
+ '[{"type":"SURVEY_NOT_ENOUGH","typeName":"报验结论不足","refNo":"PM-CT-2026-012-02","message":"付款节点「上船台款」要求至少完成 2 条合格 / 让步接收的报验结论，当前该船仅 1 条（以每张报验单最新结论计；不合格或已撤回的报验不计入）"},{"type":"PREV_NODE_UNPAID","typeName":"前序节点未付","refNo":"PM-CT-2026-012-01","message":"前序付款节点「开工款」（PM-CT-2026-012-01）尚未付款，付款节点须逐笔确认，不能跳付到「上船台款」"}]', NULL, NULL, NULL, NULL, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 66 DAY, 0),
+(7, 'PM-CT-2026-012-03', 2, 'CT-2026-012', 2, 'HN2602', '北远泰山', 3, '下水款',   30, 'PENDING', 'LAUNCHED', 3, 12360.00, NULL, NULL, 'BLOCKED', UTC_TIMESTAMP() + INTERVAL 8 HOUR,
+ '[{"type":"SURVEY_NOT_ENOUGH","typeName":"报验结论不足","refNo":"PM-CT-2026-012-03","message":"付款节点「下水款」要求至少完成 3 条合格 / 让步接收的报验结论，当前该船仅 1 条（以每张报验单最新结论计；不合格或已撤回的报验不计入）"},{"type":"VESSEL_STATUS","typeName":"船舶状态未达标","refNo":"HN2602","message":"付款节点「下水款」要求船舶至少为「已下水」，当前为「在厂」"},{"type":"PREV_NODE_UNPAID","typeName":"前序节点未付","refNo":"PM-CT-2026-012-02","message":"前序付款节点「上船台款」（PM-CT-2026-012-02）尚未付款，付款节点须逐笔确认，不能跳付到「下水款」"}]', NULL, NULL, NULL, NULL, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 66 DAY, 0),
+(8, 'PM-CT-2026-012-04', 2, 'CT-2026-012', 2, 'HN2602', '北远泰山', 4, '交船款',   40, 'PENDING', 'DELIVERED',4, 16480.00, NULL, NULL, 'BLOCKED', UTC_TIMESTAMP() + INTERVAL 8 HOUR,
+ '[{"type":"SURVEY_NOT_ENOUGH","typeName":"报验结论不足","refNo":"PM-CT-2026-012-04","message":"付款节点「交船款」要求至少完成 4 条合格 / 让步接收的报验结论，当前该船仅 1 条（以每张报验单最新结论计；不合格或已撤回的报验不计入）"},{"type":"VESSEL_STATUS","typeName":"船舶状态未达标","refNo":"HN2602","message":"付款节点「交船款」要求船舶至少为「已交付」，当前为「在厂」"},{"type":"PREV_NODE_UNPAID","typeName":"前序节点未付","refNo":"PM-CT-2026-012-03","message":"前序付款节点「下水款」（PM-CT-2026-012-03）尚未付款，付款节点须逐笔确认，不能跳付到「交船款」"}]', NULL, NULL, NULL, NULL, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 66 DAY, 0),
+-- CT-2026-013 蓝海油运 修理 2600：两节点均已付款，证据快照冻结（金额 / 报验 / 船舶状态）
+(9, 'PM-CT-2026-013-01', 3, 'CT-2026-013', 3, 'HN2603', '蓝海油运', 1, '进厂开工款', 50, 'PAID', 'IN_YARD', 1, 1300.00, 1300.00, 2600.00, 'READY', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 12 DAY, '[]',
+ '{"contractNo":"CT-2026-013","contractType":"REPAIR","contractTypeName":"坞检修理","contractAmount":2600.00,"nodeNo":"PM-CT-2026-013-01","nodeName":"进厂开工款","ratio":50,"amountDue":1300.00,"requiredAcceptSurveys":1,"requiredVesselStatus":"IN_YARD","vessel":{"id":3,"vesselNo":"HN2603","vesselName":"蓝海油运","status":"IN_YARD","statusName":"在厂"},"acceptSurveyCount":1,"acceptedSurveys":[{"surveyNo":"SV-20260425-001","blockCode":"SEG-HN2603-002","result":"PASS","resultName":"合格","inspector":"孙佩林"}],"nodes":[{"nodeNo":"PM-CT-2026-013-01","nodeName":"进厂开工款","seq":1,"ratio":50,"status":"PENDING"},{"nodeNo":"PM-CT-2026-013-02","nodeName":"验收款","seq":2,"ratio":50,"status":"PENDING"}]}',
+ 'SV-20260425-001', '费文澜', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 12 DAY, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY, 0),
+(10, 'PM-CT-2026-013-02', 3, 'CT-2026-013', 3, 'HN2603', '蓝海油运', 2, '验收款',     50, 'PAID', 'IN_YARD', 2, 1300.00, 1300.00, 2600.00, 'READY', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 10 DAY, '[]',
+ '{"contractNo":"CT-2026-013","contractType":"REPAIR","contractTypeName":"坞检修理","contractAmount":2600.00,"nodeNo":"PM-CT-2026-013-02","nodeName":"验收款","ratio":50,"amountDue":1300.00,"requiredAcceptSurveys":2,"requiredVesselStatus":"IN_YARD","vessel":{"id":3,"vesselNo":"HN2603","vesselName":"蓝海油运","status":"IN_YARD","statusName":"在厂"},"acceptSurveyCount":2,"acceptedSurveys":[{"surveyNo":"SV-20260428-002","blockCode":"SEG-HN2603-003","result":"PASS","resultName":"合格","inspector":"孙佩林"},{"surveyNo":"SV-20260425-001","blockCode":"SEG-HN2603-002","result":"PASS","resultName":"合格","inspector":"孙佩林"}],"nodes":[{"nodeNo":"PM-CT-2026-013-01","nodeName":"进厂开工款","seq":1,"ratio":50,"status":"PAID"},{"nodeNo":"PM-CT-2026-013-02","nodeName":"验收款","seq":2,"ratio":50,"status":"PENDING"}]}',
+ 'SV-20260428-002', '费文澜', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 10 DAY, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY, 0),
+-- CT-2026-015 太湖浚1 改装 3200：该船无分段报验档案，全部节点卡在报验结论不足
+(11, 'PM-CT-2026-015-01', 5, 'CT-2026-015', 5, 'HN2605', '太湖浚1', 1, '开工款',       30, 'PENDING', 'IN_YARD',  1, 960.00,  NULL, NULL, 'BLOCKED', UTC_TIMESTAMP() + INTERVAL 8 HOUR,
+ '[{"type":"SURVEY_NOT_ENOUGH","typeName":"报验结论不足","refNo":"PM-CT-2026-015-01","message":"付款节点「开工款」要求至少完成 1 条合格 / 让步接收的报验结论，当前该船仅 0 条（以每张报验单最新结论计；不合格或已撤回的报验不计入）"}]', NULL, NULL, NULL, NULL, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 46 DAY, 0),
+(12, 'PM-CT-2026-015-02', 5, 'CT-2026-015', 5, 'HN2605', '太湖浚1', 2, '改装完工款',   30, 'PENDING', 'LAUNCHED', 2, 960.00,  NULL, NULL, 'BLOCKED', UTC_TIMESTAMP() + INTERVAL 8 HOUR,
+ '[{"type":"SURVEY_NOT_ENOUGH","typeName":"报验结论不足","refNo":"PM-CT-2026-015-02","message":"付款节点「改装完工款」要求至少完成 2 条合格 / 让步接收的报验结论，当前该船仅 0 条（以每张报验单最新结论计；不合格或已撤回的报验不计入）"},{"type":"PREV_NODE_UNPAID","typeName":"前序节点未付","refNo":"PM-CT-2026-015-01","message":"前序付款节点「开工款」（PM-CT-2026-015-01）尚未付款，付款节点须逐笔确认，不能跳付到「改装完工款」"}]', NULL, NULL, NULL, NULL, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 46 DAY, 0),
+(13, 'PM-CT-2026-015-03', 5, 'CT-2026-015', 5, 'HN2605', '太湖浚1', 3, '交付验收款',   40, 'PENDING', 'DELIVERED',3, 1280.00, NULL, NULL, 'BLOCKED', UTC_TIMESTAMP() + INTERVAL 8 HOUR,
+ '[{"type":"SURVEY_NOT_ENOUGH","typeName":"报验结论不足","refNo":"PM-CT-2026-015-03","message":"付款节点「交付验收款」要求至少完成 3 条合格 / 让步接收的报验结论，当前该船仅 0 条（以每张报验单最新结论计；不合格或已撤回的报验不计入）"},{"type":"PREV_NODE_UNPAID","typeName":"前序节点未付","refNo":"PM-CT-2026-015-02","message":"前序付款节点「改装完工款」（PM-CT-2026-015-02）尚未付款，付款节点须逐笔确认，不能跳付到「交付验收款」"}]', NULL, NULL, NULL, NULL, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 46 DAY, 0),
+-- CT-2026-017 华通之星 球鼻艏修理 980：两节点已付款，冻结的是修理合同金额 980，与新造合同互不影响
+(14, 'PM-CT-2026-017-01', 7, 'CT-2026-017', 1, 'HN2601', '华通之星', 1, '进厂开工款', 50, 'PAID', 'IN_YARD', 1, 490.00, 490.00, 980.00, 'READY', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 7 DAY, '[]',
+ '{"contractNo":"CT-2026-017","contractType":"REPAIR","contractTypeName":"坞检修理","contractAmount":980.00,"nodeNo":"PM-CT-2026-017-01","nodeName":"进厂开工款","ratio":50,"amountDue":490.00,"requiredAcceptSurveys":1,"requiredVesselStatus":"IN_YARD","vessel":{"id":1,"vesselNo":"HN2601","vesselName":"华通之星","status":"IN_YARD","statusName":"在厂"},"acceptSurveyCount":4,"acceptedSurveys":[{"surveyNo":"SV-20260427-001","blockCode":"SEG-HN2601-005","result":"PASS","resultName":"合格","inspector":"孙佩林"},{"surveyNo":"SV-20260422-001","blockCode":"SEG-HN2601-001","result":"PASS","resultName":"合格","inspector":"钱广安"}],"nodes":[{"nodeNo":"PM-CT-2026-017-01","nodeName":"进厂开工款","seq":1,"ratio":50,"status":"PENDING"},{"nodeNo":"PM-CT-2026-017-02","nodeName":"验收款","seq":2,"ratio":50,"status":"PENDING"}]}',
+ 'SV-20260427-001', '费文澜', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 7 DAY, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 40 DAY, 0),
+(15, 'PM-CT-2026-017-02', 7, 'CT-2026-017', 1, 'HN2601', '华通之星', 2, '验收款',     50, 'PAID', 'IN_YARD', 2, 490.00, 490.00, 980.00, 'READY', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 5 DAY, '[]',
+ '{"contractNo":"CT-2026-017","contractType":"REPAIR","contractTypeName":"坞检修理","contractAmount":980.00,"nodeNo":"PM-CT-2026-017-02","nodeName":"验收款","ratio":50,"amountDue":490.00,"requiredAcceptSurveys":2,"requiredVesselStatus":"IN_YARD","vessel":{"id":1,"vesselNo":"HN2601","vesselName":"华通之星","status":"IN_YARD","statusName":"在厂"},"acceptSurveyCount":5,"acceptedSurveys":[{"surveyNo":"SV-20260428-001","blockCode":"SEG-HN2601-004","result":"PASS","resultName":"合格","inspector":"钱广安"},{"surveyNo":"SV-20260427-001","blockCode":"SEG-HN2601-005","result":"PASS","resultName":"合格","inspector":"孙佩林"}],"nodes":[{"nodeNo":"PM-CT-2026-017-01","nodeName":"进厂开工款","seq":1,"ratio":50,"status":"PAID"},{"nodeNo":"PM-CT-2026-017-02","nodeName":"验收款","seq":2,"ratio":50,"status":"PENDING"}]}',
+ 'SV-20260428-001', '费文澜', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 5 DAY, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 40 DAY, 0);
+
+-- ---------------- 合同付款节点操作记录（种子，证据链样例） ----------------
+-- 进入结算 CREATE + 已付款 CONFIRM；另留一条「下水款条件不满足被驳回」的失败尝试，展示失败留痕且不产生扣款
+INSERT INTO contract_payment_log (id, contract_id, node_id, node_no, vessel_id, action, source_type, source_ref, verdict, contract_amount, accept_survey_count, vessel_status, blockers_json, evidence_json, operator, note, created_at) VALUES
+(1, 1, NULL, NULL, 1, 'CREATE', 'RECHECK', 'CT-2026-011', 'BLOCKED', 38600.00, 5, 'IN_YARD',
+ '[{"type":"PREV_NODE_UNPAID","typeName":"前序节点未付","refNo":"PM-CT-2026-011-01","message":"前序付款节点「开工款」（PM-CT-2026-011-01）尚未付款，付款节点须逐笔确认，不能跳付到「上船台款」"}]', NULL,
+ '马国栋', '合同 CT-2026-011 进入结算流程，生成 4 个付款节点（新船建造），应付金额按合同金额 38600.00 万元 × 比例计算；开工款已具备条件，下水 / 交船款还受船舶状态约束', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 70 DAY),
+(2, 2, NULL, NULL, 2, 'CREATE', 'RECHECK', 'CT-2026-012', 'BLOCKED', 41200.00, 1, 'IN_YARD',
+ '[{"type":"SURVEY_NOT_ENOUGH","typeName":"报验结论不足","refNo":"PM-CT-2026-012-02","message":"付款节点「上船台款」要求至少完成 2 条合格 / 让步接收的报验结论，当前该船仅 1 条（以每张报验单最新结论计；不合格或已撤回的报验不计入）"}]', NULL,
+ '马国栋', '合同 CT-2026-012 进入结算流程，生成 4 个付款节点（新船建造），应付金额按合同金额 41200.00 万元 × 比例计算', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 66 DAY),
+(3, 3, NULL, NULL, 3, 'CREATE', 'RECHECK', 'CT-2026-013', 'READY', 2600.00, 1, 'IN_YARD', '[]', NULL,
+ '费文澜', '合同 CT-2026-013 进入结算流程，生成 2 个付款节点（坞检修理），应付金额按合同金额 2600.00 万元 × 比例计算', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 60 DAY),
+(4, 3, 9, 'PM-CT-2026-013-01', 3, 'CONFIRM', 'RECHECK', 'SV-20260425-001', 'READY', 2600.00, 1, 'IN_YARD', '[]', NULL,
+ '费文澜', '确认付款 1300.00 万元（合同金额 2600.00 × 50%），依据报验 SV-20260425-001（合格）、船舶状态「在厂」。付款确认完成，等待后续节点', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 12 DAY),
+(5, 3, 10, 'PM-CT-2026-013-02', 3, 'CONFIRM', 'RECHECK', 'SV-20260428-002', 'READY', 2600.00, 2, 'IN_YARD', '[]', NULL,
+ '费文澜', '确认付款 1300.00 万元（合同金额 2600.00 × 50%），依据报验 SV-20260428-002（合格）、船舶状态「在厂」。末笔付款确认，合同全部 2 个节点结清，合同置为「已结算」', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 10 DAY),
+(6, 5, NULL, NULL, 5, 'CREATE', 'RECHECK', 'CT-2026-015', 'BLOCKED', 3200.00, 0, 'DELIVERED',
+ '[{"type":"SURVEY_NOT_ENOUGH","typeName":"报验结论不足","refNo":"PM-CT-2026-015-01","message":"付款节点「开工款」要求至少完成 1 条合格 / 让步接收的报验结论，当前该船仅 0 条（以每张报验单最新结论计；不合格或已撤回的报验不计入）"}]', NULL,
+ '马国栋', '合同 CT-2026-015 进入结算流程，生成 3 个付款节点（改装加长），应付金额按合同金额 3200.00 万元 × 比例计算', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 46 DAY),
+(7, 7, NULL, NULL, 1, 'CREATE', 'RECHECK', 'CT-2026-017', 'READY', 980.00, 4, 'IN_YARD', '[]', NULL,
+ '费文澜', '合同 CT-2026-017 进入结算流程，生成 2 个付款节点（坞检修理），应付金额按合同金额 980.00 万元 × 比例计算', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 40 DAY),
+(8, 7, 14, 'PM-CT-2026-017-01', 1, 'CONFIRM', 'RECHECK', 'SV-20260427-001', 'READY', 980.00, 4, 'IN_YARD', '[]', NULL,
+ '费文澜', '确认付款 490.00 万元（合同金额 980.00 × 50%），依据报验 SV-20260427-001（合格）、船舶状态「在厂」。付款确认完成，等待后续节点', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 7 DAY),
+(9, 7, 15, 'PM-CT-2026-017-02', 1, 'CONFIRM', 'RECHECK', 'SV-20260428-001', 'READY', 980.00, 5, 'IN_YARD', '[]', NULL,
+ '费文澜', '确认付款 490.00 万元（合同金额 980.00 × 50%），依据报验 SV-20260428-001（合格）、船舶状态「在厂」。末笔付款确认，合同全部 2 个节点结清，合同置为「已结算」', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 5 DAY),
+(10, 1, 3, 'PM-CT-2026-011-03', 1, 'CONFIRM_REJECT', 'RECHECK', 'PM-CT-2026-011-03', 'BLOCKED', 38600.00, 5, 'IN_YARD',
+ '[{"type":"VESSEL_STATUS","typeName":"船舶状态未达标","refNo":"HN2601","message":"付款节点「下水款」要求船舶至少为「已下水」，当前为「在厂」"}]', NULL,
+ '费文澜', '付款确认被驳回：付款节点「下水款」要求船舶至少为「已下水」，当前为「在厂」（本次操作整体回滚，合同已付金额不变）', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 3 DAY);
 
 -- ---------------- 起重设备排程操作日志（种子，责任追溯链样例） ----------------
 INSERT INTO crane_schedule_log (id, action_type, crane_id, crane_no, crane_name, other_crane_id, other_crane_no, erection_id, erection_no, lift_id, lift_no, block_code, detail, operator, created_at) VALUES

@@ -40,16 +40,19 @@ public class VesselService {
     private final BlockRepository blockRepository;
     private final BerthRepository berthRepository;
     private final BerthMoveLogRepository berthMoveLogRepository;
+    private final PaymentSettlementService settlementService;
 
     public VesselService(VesselRepository vesselRepository, OwnerRepository ownerRepository,
             ContractRepository contractRepository, BlockRepository blockRepository,
-            BerthRepository berthRepository, BerthMoveLogRepository berthMoveLogRepository) {
+            BerthRepository berthRepository, BerthMoveLogRepository berthMoveLogRepository,
+            PaymentSettlementService settlementService) {
         this.vesselRepository = vesselRepository;
         this.ownerRepository = ownerRepository;
         this.contractRepository = contractRepository;
         this.blockRepository = blockRepository;
         this.berthRepository = berthRepository;
         this.berthMoveLogRepository = berthMoveLogRepository;
+        this.settlementService = settlementService;
     }
 
     public List<Vessel> list() {
@@ -96,6 +99,7 @@ public class VesselService {
     @Transactional
     public Vessel update(Long id, VesselRequest request) {
         Vessel vessel = get(id);
+        String oldStatus = vessel.getStatus();
         if (StringUtils.hasText(request.getVesselNo()) && !request.getVesselNo().equals(vessel.getVesselNo())
                 && vesselRepository.existsByVesselNo(request.getVesselNo())) {
             throw new BizException("本厂船号已存在：" + request.getVesselNo());
@@ -116,7 +120,12 @@ public class VesselService {
             bindOwner(vessel);
         }
         checkScale(vessel);
-        return vesselRepository.save(vessel);
+        Vessel saved = vesselRepository.save(vessel);
+        // 船舶状态变化（如下水 / 交付）：同事务重算该船全部待结算付款节点，已付款节点不动
+        if (request.getStatus() != null && !request.getStatus().equals(oldStatus)) {
+            settlementService.recalcByVesselStatus(saved, request.getOperator());
+        }
+        return saved;
     }
 
     @Transactional
@@ -131,13 +140,16 @@ public class VesselService {
         vesselRepository.deleteById(id);
     }
 
-    /** 时间轴视图：船舶 + 船东 + 合同 + 分段进度 */
+    /** 时间轴视图：船舶 + 船东 + 合同（带实时付款结算状态）+ 分段进度 */
+    @Transactional(readOnly = true)
     public Map<String, Object> board() {
         Map<String, Object> data = new LinkedHashMap<>();
         List<Vessel> vessels = vesselRepository.findAllByOrderByIdAsc();
         data.put("vessels", vessels);
         data.put("owners", ownerRepository.findAllByOrderByIdAsc());
-        data.put("contracts", contractRepository.findAllByOrderByIdAsc());
+        List<Contract> contracts = contractRepository.findAllByOrderByIdAsc();
+        settlementService.decorateAll(contracts);
+        data.put("contracts", contracts);
         data.put("types", vesselRepository.statByVesselType());
         List<Map<String, Object>> typeMeta = new ArrayList<>();
         for (String type : Dict.VESSEL_TYPES) {
@@ -151,13 +163,16 @@ public class VesselService {
         return data;
     }
 
-    /** 单船台账：船 + 当前船台 + 合同 + 分段 + 移泊记录（与船台总览同源，移泊后三处一致） */
+    /** 单船台账：船 + 当前船台 + 合同（带实时付款节点）+ 分段 + 移泊记录（三处结算状态同源） */
+    @Transactional(readOnly = true)
     public Map<String, Object> detail(Long id) {
         Vessel vessel = get(id);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("vessel", vessel);
         data.put("berth", berthRepository.findFirstByVesselIdAndStatusOrderByIdAsc(id, "OCCUPIED").orElse(null));
-        data.put("contracts", contractRepository.findByVesselIdOrderByIdAsc(id));
+        List<Contract> contracts = contractRepository.findByVesselIdOrderByIdAsc(id);
+        settlementService.decorateAll(contracts);
+        data.put("contracts", contracts);
         data.put("blocks", blockRepository.findByVesselIdOrderBySegSeqAsc(id));
         data.put("moveLogs", berthMoveLogRepository.findByVesselIdOrderByIdDesc(id));
         return data;

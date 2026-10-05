@@ -16,12 +16,14 @@ import org.springframework.util.StringUtils;
 import com.shipyard.dock.common.BizException;
 import com.shipyard.dock.common.Dict;
 import com.shipyard.dock.domain.Block;
+import com.shipyard.dock.domain.Contract;
 import com.shipyard.dock.domain.PunchItem;
 import com.shipyard.dock.domain.Survey;
 import com.shipyard.dock.dto.PunchItemRequest;
 import com.shipyard.dock.dto.SurveyRequest;
 import com.shipyard.dock.generation.CodeSequenceService;
 import com.shipyard.dock.repository.BlockRepository;
+import com.shipyard.dock.repository.ContractRepository;
 import com.shipyard.dock.repository.PunchItemRepository;
 import com.shipyard.dock.repository.SurveyRepository;
 
@@ -31,22 +33,32 @@ import com.shipyard.dock.repository.SurveyRepository;
  * <p>规则：① 报验单号唯一（由 {@code @SurveyNo} + Hibernate {@code @ValueGenerationType} 生成）；
  * ② 结论只能 合格 / 让步 / 不合格；③ 判不合格必须至少开一条遗留项；
  * ④ 遗留项闭环前，所属分段不允许置为已交验。</p>
+ *
+ * <p>结算联动：报验结果被补录（新增）、撤回（删除）或改为让步接收 / 不合格（更新结论）后，
+ * 同一事务内调用 {@link PaymentSettlementService} 重算该船所有履行中 / 已结算合同的
+ * 待结算付款节点，操作者与触发来源写入只追加的操作记录；已付款节点与原确认记录不动。</p>
  */
 @Service
 public class SurveyService {
 
     /** 遗留项编号序号键 */
     private static final String PUNCH_SEQ_KEY = "PUNCH_NO";
+    private static final String DEFAULT_OPERATOR = "报验台账";
 
     private final SurveyRepository surveyRepository;
     private final PunchItemRepository punchItemRepository;
     private final BlockRepository blockRepository;
+    private final ContractRepository contractRepository;
+    private final PaymentSettlementService settlementService;
 
     public SurveyService(SurveyRepository surveyRepository, PunchItemRepository punchItemRepository,
-            BlockRepository blockRepository) {
+            BlockRepository blockRepository, ContractRepository contractRepository,
+            PaymentSettlementService settlementService) {
         this.surveyRepository = surveyRepository;
         this.punchItemRepository = punchItemRepository;
         this.blockRepository = blockRepository;
+        this.contractRepository = contractRepository;
+        this.settlementService = settlementService;
     }
 
     public List<Survey> list() {
@@ -119,12 +131,18 @@ public class SurveyService {
                 punchItemRepository.save(punch);
             }
         }
+        // 报验补录：合格 / 让步结论可能使待结算节点转为可付款，同事务联动重算
+        if ("PASS".equals(saved.getResult()) || "CONCESSION".equals(saved.getResult())) {
+            settlementService.recalcBySurvey(saved.getVesselId(), "SURVEY_UPSERT",
+                    saved.getSurveyNo(), operator(request.getOperator()));
+        }
         return saved;
     }
 
     @Transactional
     public Survey update(Long id, SurveyRequest request) {
         Survey survey = get(id);
+        String oldResult = survey.getResult();
         if (request.getSurveyItem() != null && !Dict.isValidSurveyItem(request.getSurveyItem())) {
             throw new BizException("报验项目非法（焊缝探伤 / 主尺度 / 涂装膜厚 / 舾装完整性 / 舱室密性 五选一）："
                     + request.getSurveyItem());
@@ -165,18 +183,39 @@ public class SurveyService {
                 punchItemRepository.save(punch);
             }
         }
+        // 结论改判（含补录合格 / 改为让步接收 / 改为不合格）：待结算节点按新结论同事务重算
+        if (request.getResult() != null && !request.getResult().equals(oldResult)) {
+            settlementService.recalcBySurvey(saved.getVesselId(), "SURVEY_UPSERT",
+                    saved.getSurveyNo() + "（" + Dict.surveyResultName(oldResult) + "→"
+                            + Dict.surveyResultName(saved.getResult()) + "）",
+                    operator(request.getOperator()));
+        }
         return saved;
     }
 
     @Transactional
     public void delete(Long id) {
+        delete(id, null);
+    }
+
+    @Transactional
+    public void delete(Long id, String operator) {
         Survey survey = get(id);
         List<PunchItem> items = punchItemRepository.findBySurveyIdOrderByIdAsc(id);
         if (!items.isEmpty()) {
             throw new BizException("报验单 " + survey.getSurveyNo() + " 下还有 " + items.size()
                     + " 条遗留项，请先处理遗留项再删除");
         }
+        Long vesselId = survey.getVesselId();
+        String surveyNo = survey.getSurveyNo();
+        String oldResult = survey.getResult();
         surveyRepository.deleteById(id);
+        // 报验撤回：以撤回前结论是否为有效结算依据决定是否重算（撤回合格 / 让步会使节点回到待结算）
+        if ("PASS".equals(oldResult) || "CONCESSION".equals(oldResult)) {
+            settlementService.recalcBySurvey(vesselId, "SURVEY_DELETE",
+                    "撤回报验单 " + surveyNo + "（原结论：" + Dict.surveyResultName(oldResult) + "）",
+                    operator(operator));
+        }
     }
 
     // ---------------- 遗留项 ----------------
@@ -273,7 +312,7 @@ public class SurveyService {
         punchItemRepository.deleteById(id);
     }
 
-    /** 左右双栏对照视图：报验项 + 遗留项清单 */
+    /** 左右双栏对照视图：报验项 + 遗留项清单 + 各船合同结算联动状态（与合同列表同源） */
     public Map<String, Object> board() {
         Map<String, Object> data = new LinkedHashMap<>();
         List<Survey> surveys = surveyRepository.findAllByOrderBySurveyDateDesc();
@@ -282,6 +321,35 @@ public class SurveyService {
         data.put("punchItems", punchItems);
         data.put("blocks", blockRepository.findAllByOrderByIdAsc());
         data.put("verdicts", surveyRepository.statByResult());
+
+        // 各船合同付款结算状态：报验列表刷新后与合同详情、船舶合同列表看到同一份状态与阻塞
+        Map<String, Object> settlementByVessel = new LinkedHashMap<>();
+        for (Contract contract : contractRepository.findAllByOrderByIdAsc()) {
+            if (contract.getVesselId() == null
+                    || (!"PERFORMING".equals(contract.getStatus()) && !"SETTLED".equals(contract.getStatus()))) {
+                continue;
+            }
+            settlementService.decorate(contract, false);
+            String key = String.valueOf(contract.getVesselId());
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> rows = (List<Map<String, Object>>)
+                    settlementByVessel.computeIfAbsent(key, k -> new ArrayList<Map<String, Object>>());
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("id", contract.getId());
+            row.put("contractNo", contract.getContractNo());
+            row.put("contractTypeName", contract.getContractTypeName());
+            row.put("status", contract.getStatus());
+            row.put("statusName", contract.getStatusName());
+            row.put("paymentState", contract.getPaymentState());
+            row.put("paymentStateName", contract.getPaymentStateName());
+            row.put("paidNodeCount", contract.getPaidNodeCount());
+            row.put("totalNodeCount", contract.getTotalNodeCount());
+            row.put("settledAmount", contract.getSettledAmount());
+            row.put("amount", contract.getAmount());
+            row.put("blockers", contract.getBlockers());
+            rows.add(row);
+        }
+        data.put("settlementByVessel", settlementByVessel);
 
         List<Map<String, Object>> resultMeta = new ArrayList<>();
         for (String result : Dict.SURVEY_RESULTS) {
@@ -306,13 +374,15 @@ public class SurveyService {
         return data;
     }
 
-    /** 报验单详情：报验单 + 遗留项 + 分段 */
+    /** 报验单详情：报验单 + 遗留项 + 分段 + 对合同付款结算的影响（与合同详情同源同状态） */
     public Map<String, Object> detail(Long id) {
         Survey survey = get(id);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("survey", survey);
         data.put("punchItems", punchItemRepository.findBySurveyIdOrderByIdAsc(id));
         blockRepository.findById(survey.getBlockId()).ifPresent(block -> data.put("block", block));
+        // 该报验对所属船合同付款节点的影响：刷新后看到的结算状态 / 阻塞原因与合同详情完全一致
+        data.put("settlement", settlementService.surveySettlementImpact(id, survey));
         return data;
     }
 
@@ -323,6 +393,10 @@ public class SurveyService {
                 : LocalDate.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
         long seq = CodeSequenceService.next(PUNCH_SEQ_KEY, scope);
         return "PI-" + scope + "-" + String.format("%02d", seq);
+    }
+
+    private String operator(String value) {
+        return StringUtils.hasText(value) ? value.trim() : DEFAULT_OPERATOR;
     }
 
     private void applyPartial(Survey survey, SurveyRequest request) {

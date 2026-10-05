@@ -71,6 +71,44 @@ function punchOf(surveyId) {
   return punchItems.value.filter((p) => p.surveyId === surveyId)
 }
 
+/** 该报验单对所属船合同付款节点的影响（与合同详情同源同状态） */
+const settlementContracts = computed(() => detail.value?.settlement?.contracts || [])
+
+function paymentColor(state) {
+  if (state === 'PAID') return 'var(--pass)'
+  if (state === 'PARTIAL') return 'var(--slipway)'
+  if (state === 'PENDING') return 'var(--warn)'
+  return 'var(--steel)'
+}
+
+/** 付款结算弹窗（报验详情里查看同一后端口径的节点状态 / 阻塞 / 证据） */
+const settlementDialog = ref(false)
+const settlementData = ref(null)
+const settlementLoading = ref(false)
+
+async function openContractSettlement(row) {
+  settlementLoading.value = true
+  settlementDialog.value = true
+  try {
+    settlementData.value = await api.vessel.contractSettlement(row.id)
+  } catch (e) {
+    ElMessage.error(e.message)
+    settlementDialog.value = false
+  } finally {
+    settlementLoading.value = false
+  }
+}
+
+function fmtTime(value) {
+  return String(value || '').replace('T', ' ').slice(0, 19) || '-'
+}
+
+/** 报验列表卡片：该报验所属船的合同结算状态（刷新与合同详情一致） */
+function settlementHint(survey) {
+  const map = board.value.settlementByVessel || {}
+  return map[String(survey.vesselId)] || []
+}
+
 async function advancePunch(item) {
   loading.value = true
   try {
@@ -178,6 +216,61 @@ onMounted(load)
         </el-table-column>
       </el-table>
       <div class="empty-tip" v-else>本单没有遗留项</div>
+
+      <!-- 本报验对合同付款结算的影响：与合同详情、船舶合同列表同一份状态与阻塞原因 -->
+      <div class="panel-title" style="margin-top:14px">
+        对合同付款结算的影响
+        <span class="view-tip">状态与阻塞项由后端按合同金额 / 报验结论 / 船舶状态统一计算，报验改判或撤回会自动重算</span>
+      </div>
+      <template v-if="settlementContracts.length">
+        <div v-for="c in settlementContracts" :key="c.id" class="settle-card" :class="{ hit: c.referencesThisSurvey }">
+          <div class="sc-settle-head">
+            <b>{{ c.contractNo }}</b>
+            <span class="tag-line">{{ c.contractTypeName }}</span>
+            <span class="tag-line" :style="{ background: paymentColor(c.paymentState), color: '#fff' }">
+              {{ c.paymentStateName }} {{ c.paidNodeCount }}/{{ c.totalNodeCount }}
+            </span>
+            <span class="view-tip" v-if="c.referencesThisSurvey">本报验被该合同结算引用</span>
+            <el-button size="small" type="primary" plain style="margin-left:auto" @click="openContractSettlement(c)">
+              付款节点 / 历史
+            </el-button>
+          </div>
+          <el-table :data="c.nodes" size="small" style="margin-top:6px">
+            <el-table-column label="节点" min-width="120">
+              <template #default="{ row }">{{ row.seq }}. {{ row.nodeName }}（{{ row.ratio }}%）</template>
+            </el-table-column>
+            <el-table-column label="状态" width="90">
+              <template #default="{ row }">
+                <span :style="{ color: row.status === 'PAID' ? 'var(--pass)' : 'var(--warn)', fontWeight: 700 }">
+                  {{ row.statusName }}
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column label="当前依据" width="210">
+              <template #default="{ row }">
+                <template v-if="row.status === 'PAID'">已付 {{ row.amountPaid }} 万 · {{ row.settleRef }}</template>
+                <template v-else>
+                  报验 {{ row.currentAcceptCount }}/{{ row.requiredAcceptSurveys }}
+                  · 船舶 {{ row.currentVesselStatusName }}
+                </template>
+              </template>
+            </el-table-column>
+            <el-table-column label="阻塞项" min-width="260">
+              <template #default="{ row }">
+                <div v-if="row.blockers && row.blockers.length">
+                  <div v-for="(b, i) in row.blockers" :key="i" class="settle-blocker">· {{ b.message }}</div>
+                </div>
+                <span v-else-if="row.status === 'PENDING'" style="color:var(--pass)">条件满足，可确认付款</span>
+                <span v-else style="color:var(--ink-dim)">证据已冻结，不可倒改</span>
+              </template>
+            </el-table-column>
+          </el-table>
+          <div v-if="c.settlementWarnings && c.settlementWarnings.length" class="settle-warn">
+            <div v-for="(w, i) in c.settlementWarnings" :key="i">· {{ w }}</div>
+          </div>
+        </div>
+      </template>
+      <div class="empty-tip" v-else>本报验所属船舶还没有进入结算流程（履行中）的合同</div>
     </section>
 
     <!-- 双栏对照 -->
@@ -203,6 +296,11 @@ onMounted(load)
             <div class="sc-line">{{ survey.blockCode }} · {{ survey.surveyItemName }}</div>
             <div class="sc-line dim">{{ survey.authorityName }} · {{ survey.inspector }} · {{ survey.surveyDate }}</div>
             <div class="sc-line dim2" v-if="punchOf(survey.id).length">遗留项 {{ punchOf(survey.id).length }} 条，未闭环 {{ punchOf(survey.id).filter((p) => p.status !== 'CLOSED').length }} 条</div>
+            <div class="sc-settle-hint" v-for="c in settlementHint(survey)" :key="c.id">
+              <span class="sdot" :style="{ background: paymentColor(c.paymentState) }"></span>
+              {{ c.contractNo }} · {{ c.paymentStateName }} {{ c.paidNodeCount }}/{{ c.totalNodeCount }}
+              <template v-if="c.blockers && c.blockers.length"> · {{ c.blockers[0].message }}</template>
+            </div>
           </div>
           <div class="empty-tip" v-if="!shownSurveys.length">该结论下没有报验单</div>
         </div>
@@ -284,6 +382,69 @@ onMounted(load)
         <el-button type="primary" @click="submitSurvey">提交报验</el-button>
       </template>
     </el-dialog>
+
+    <!-- 合同付款结算只读详情（报验页核对同一份状态 / 阻塞 / 历史） -->
+    <el-dialog
+      v-model="settlementDialog" :title="settlementData ? `付款结算 · ${settlementData.contract.contractNo}` : '付款结算'"
+      width="880px" top="6vh"
+    >
+      <div v-loading="settlementLoading" v-if="settlementData">
+        <div class="sc-settle-head">
+          <span class="tag-line" :style="{ background: paymentColor(settlementData.contract.paymentState), color: '#fff' }">
+            {{ settlementData.contract.paymentStateName }}
+            {{ settlementData.contract.paidNodeCount }}/{{ settlementData.contract.totalNodeCount }}
+          </span>
+          <span class="view-tip">
+            合同金额 {{ settlementData.contract.amount }} 万 · 已付 {{ settlementData.contract.settledAmount }} 万
+            · 付款确认请到「船舶合同」页操作
+          </span>
+        </div>
+        <el-table :data="settlementData.nodes" size="small" border style="margin-top:8px">
+          <el-table-column label="节点" min-width="110">
+            <template #default="{ row }">{{ row.seq }}. {{ row.nodeName }}（{{ row.ratio }}%）</template>
+          </el-table-column>
+          <el-table-column label="金额(万)" width="90">
+            <template #default="{ row }">{{ row.amountDue }}</template>
+          </el-table-column>
+          <el-table-column label="状态" width="90">
+            <template #default="{ row }">
+              <span :style="{ color: row.status === 'PAID' ? 'var(--pass)' : 'var(--warn)', fontWeight: 700 }">
+                {{ row.statusName }}
+              </span>
+            </template>
+          </el-table-column>
+          <el-table-column label="依据 / 阻塞" min-width="280">
+            <template #default="{ row }">
+              <div v-if="row.status === 'PAID'" class="view-tip">
+                按冻结合同金额 {{ row.frozenContractAmount }} 万 · {{ row.settleRef }}
+                · 付款时船舶「{{ row.evidence?.vessel?.statusName }}」 · {{ row.confirmedBy }} {{ fmtTime(row.confirmedAt) }}
+              </div>
+              <template v-else>
+                <div v-if="row.blockers && row.blockers.length">
+                  <div v-for="(b, i) in row.blockers" :key="i" class="settle-blocker">· {{ b.message }}</div>
+                </div>
+                <span v-else style="color:var(--pass)">条件满足，可确认付款</span>
+              </template>
+            </template>
+          </el-table-column>
+        </el-table>
+
+        <div class="panel-sub" style="font-size:12.5px;font-weight:700;margin:12px 0 6px">联动与确认记录（只追加）</div>
+        <div class="sv-loglist">
+          <div v-for="log in settlementData.logs" :key="log.id" class="sv-logitem">
+            <div class="sc-settle-head">
+              <span class="tag-line">{{ log.actionName }}</span>
+              <span v-if="log.verdict" :style="{ color: log.verdict === 'READY' ? 'var(--pass)' : 'var(--fail)', fontWeight: 700 }">
+                {{ log.verdictName }}
+              </span>
+              <span class="view-tip">{{ log.operator }} · {{ fmtTime(log.createdAt) }}</span>
+            </div>
+            <div class="view-tip" style="margin-top:3px">{{ log.note }}</div>
+            <div v-for="(b, i) in (log.blockers || [])" :key="i" class="settle-blocker">· {{ b.message }}</div>
+          </div>
+        </div>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
@@ -363,4 +524,31 @@ onMounted(load)
 .punch-editor { border-top: 1px dashed var(--line-strong); margin-top: 6px; padding-top: 8px; }
 .pe-head { display: flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 700; }
 .pe-item { display: flex; gap: 6px; margin-top: 8px; }
+
+/* 付款结算联动（报验页） */
+.settle-card {
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  padding: 9px 11px;
+  margin-top: 10px;
+  background: #fff;
+}
+.settle-card.hit { border-left: 4px solid var(--primary); }
+.sc-settle-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.settle-blocker { font-size: 11.5px; color: var(--fail); line-height: 1.6; }
+.settle-warn { margin-top: 6px; }
+.settle-warn div { font-size: 11px; color: var(--warn); line-height: 1.6; }
+.sc-settle-hint {
+  font-size: 10.5px;
+  color: var(--ink-dim);
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px dotted var(--line);
+  display: flex;
+  gap: 5px;
+  align-items: center;
+}
+.sdot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; }
+.sv-loglist { display: flex; flex-direction: column; gap: 7px; max-height: 260px; overflow-y: auto; }
+.sv-logitem { border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; background: #fbfcfc; }
 </style>

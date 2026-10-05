@@ -79,7 +79,7 @@ public final class Dict {
             "REPAIR", "坞检修理",
             "CONVERSION", "改装加长");
 
-    /** 草拟 → 已签 → 履行中 → 已结算，逐级推进，不可跳级 */
+    /** 草拟 → 已签 → 履行中（进入结算流程，按付款节点逐笔结算）→ 已结算（全部节点已付款） */
     public static final List<String> CONTRACT_FLOW = List.of("DRAFT", "SIGNED", "PERFORMING", "SETTLED");
 
     private static final Map<String, String> CONTRACT_STATUS_NAME = Map.of(
@@ -87,6 +87,31 @@ public final class Dict {
             "SIGNED", "已签",
             "PERFORMING", "履行中",
             "SETTLED", "已结算");
+
+    // ---------------- 合同付款节点（进入结算流程后逐笔确认） ----------------
+    /** 节点状态：PENDING 待结算（条件未满足时停留于此并逐条记录阻塞项）/ PAID 已付款（历史不可覆盖） */
+    public static final List<String> PAYMENT_NODE_STATUSES = List.of("PENDING", "PAID");
+
+    private static final Map<String, String> PAYMENT_NODE_STATUS_NAME = Map.of(
+            "PENDING", "待结算",
+            "PAID", "已付款");
+
+    /**
+     * 各合同类型的付款节点模板（节点顺序 = 确认顺序，比例合计 100%）。
+     * requiredVesselStatus：该节点要求船舶至少到达的状态（IN_YARD → LAUNCHED → DELIVERED 递进）；
+     * requiredAcceptSurveys：要求该船已完成的「合格 / 让步接收」报验结论条数（以每张报验单最新结论计）。
+     * 让步接收（CONCESSION）与合格（PASS）同为有效报验结论，可作为结算依据。
+     */
+    public static final List<PaymentMilestoneTemplate> PAYMENT_TEMPLATES = List.of(
+            new PaymentMilestoneTemplate("NEW_BUILD", "开工款", 10, "IN_YARD", 1),
+            new PaymentMilestoneTemplate("NEW_BUILD", "上船台款", 20, "IN_YARD", 2),
+            new PaymentMilestoneTemplate("NEW_BUILD", "下水款", 30, "LAUNCHED", 3),
+            new PaymentMilestoneTemplate("NEW_BUILD", "交船款", 40, "DELIVERED", 4),
+            new PaymentMilestoneTemplate("REPAIR", "进厂开工款", 50, "IN_YARD", 1),
+            new PaymentMilestoneTemplate("REPAIR", "验收款", 50, "IN_YARD", 2),
+            new PaymentMilestoneTemplate("CONVERSION", "开工款", 30, "IN_YARD", 1),
+            new PaymentMilestoneTemplate("CONVERSION", "改装完工款", 30, "LAUNCHED", 2),
+            new PaymentMilestoneTemplate("CONVERSION", "交付验收款", 40, "DELIVERED", 3));
 
     // ---------------- 分段 ----------------
     public static final List<String> BLOCK_TYPES = List.of(
@@ -250,6 +275,24 @@ public final class Dict {
             "SIGN", "质量签认",
             "CONFIRM", "确认放行",
             "VOID", "作废");
+
+    // ---------------- 付款节点操作记录（只追加的审计动作） ----------------
+    /** CREATE 进入结算生成节点 / RECALC 报验或船舶状态联动重算 / CONFIRM 确认付款 / CONFIRM_REJECT 确认被驳回 */
+    public static final List<String> PAYMENT_ACTIONS = List.of("CREATE", "RECALC", "CONFIRM", "CONFIRM_REJECT");
+
+    private static final Map<String, String> PAYMENT_ACTION_NAME = Map.of(
+            "CREATE", "进入结算 · 生成付款节点",
+            "RECALC", "报验 / 船舶状态联动重算",
+            "CONFIRM", "确认付款",
+            "CONFIRM_REJECT", "付款确认被驳回");
+
+    /** 付款节点联动的来源类型（历史记录里说明当时因何触发重算） */
+    private static final Map<String, String> PAYMENT_SOURCE_NAME = Map.of(
+            "SURVEY_UPSERT", "报验结果补录 / 改判",
+            "SURVEY_DELETE", "报验单撤回",
+            "VESSEL_STATUS", "船舶状态变化",
+            "CONTRACT_AMOUNT", "合同金额调整",
+            "RECHECK", "手工复核");
 
     // ---------------- 业务阈值 ----------------
     /** 单个分段重量上限（吨） */
@@ -472,5 +515,38 @@ public final class Dict {
 
     public static String clearanceCheckTypeName(String checkType) {
         return checkType == null ? "" : CLEARANCE_CHECK_TYPE_NAME.getOrDefault(checkType, checkType);
+    }
+
+    // ---------------- 付款节点取值方法 ----------------
+
+    public static boolean isValidPaymentNodeStatus(String status) {
+        return status != null && PAYMENT_NODE_STATUS_NAME.containsKey(status);
+    }
+
+    public static String paymentNodeStatusName(String status) {
+        return status == null ? "" : PAYMENT_NODE_STATUS_NAME.getOrDefault(status, status);
+    }
+
+    public static String paymentActionName(String action) {
+        return action == null ? "" : PAYMENT_ACTION_NAME.getOrDefault(action, action);
+    }
+
+    public static String paymentSourceName(String source) {
+        return source == null ? "" : PAYMENT_SOURCE_NAME.getOrDefault(source, source);
+    }
+
+    /** 某合同类型的付款节点模板（按确认顺序） */
+    public static List<PaymentMilestoneTemplate> paymentTemplates(String contractType) {
+        return PAYMENT_TEMPLATES.stream().filter(t -> t.contractType().equals(contractType)).toList();
+    }
+
+    /** 船舶状态在 建档 → 已下水 → 已交付 链条上的序号，用于「至少到达」判断 */
+    public static int vesselStatusRank(String status) {
+        return VESSEL_STATUSES.indexOf(status);
+    }
+
+    /** 付款节点模板 */
+    public record PaymentMilestoneTemplate(
+            String contractType, String name, int ratio, String requiredVesselStatus, int requiredAcceptSurveys) {
     }
 }
